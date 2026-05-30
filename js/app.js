@@ -7757,34 +7757,99 @@
 
   // --- Connect to Server (hosted mode) ---
 
+  const CLOUD_API = 'https://ironshelf-cloud.padragantrbs.workers.dev';
+
   function renderConnectServer() {
     const app = document.getElementById('app');
     const savedUrl = localStorage.getItem('ironshelf_server_url') || '';
 
     app.innerHTML = `
       <div class="login-container">
-        <div class="login-card" style="max-width:480px">
-          <div class="login-brand">
-            <img src="/favicon.svg" alt="" width="48" height="48">
+        <div class="login-card" style="max-width:520px">
+          <div class="login-brand" style="text-align:center;margin-bottom:var(--space-6)">
+            <img src="/favicon.svg" alt="" width="48" height="48" style="margin-bottom:var(--space-2)">
             <h1 class="text-brand" style="font-size:var(--text-2xl)">Iron<em>&amp;</em>shelf</h1>
+            <p style="color:var(--color-text-dim);font-size:var(--text-sm)">Your books, everywhere</p>
           </div>
-          <p style="text-align:center;color:var(--color-text-dim);margin-bottom:var(--space-6)">
-            Connect to your self-hosted Ironshelf server
-          </p>
 
+          <!-- Cloud Sign In -->
+          <div id="cloud-section" style="margin-bottom:var(--space-6)">
+            <div id="cloud-login-view">
+              <button class="btn btn-primary" style="width:100%;padding:var(--space-3)" id="cloud-signin-btn">
+                Sign in with Ironshelf Cloud
+              </button>
+              <p style="text-align:center;margin-top:var(--space-2);font-size:var(--text-sm);color:var(--color-muted)">
+                Access your servers from anywhere · <a href="#" id="cloud-register-link">Create account</a>
+              </p>
+            </div>
+
+            <!-- Cloud Login Form (hidden initially) -->
+            <form id="cloud-login-form" style="display:none">
+              <h3 style="margin-bottom:var(--space-4)">Sign in to Ironshelf Cloud</h3>
+              <div class="form-group">
+                <label>Email or Username</label>
+                <input type="text" class="form-input" name="email_or_username" required autofocus>
+              </div>
+              <div class="form-group">
+                <label>Password</label>
+                <input type="password" class="form-input" name="password" required>
+              </div>
+              <div id="cloud-login-status" style="margin-bottom:var(--space-3)"></div>
+              <button type="submit" class="btn btn-primary" style="width:100%">Sign In</button>
+              <p style="text-align:center;margin-top:var(--space-2);font-size:var(--text-sm)">
+                <a href="#" id="cloud-back-link">← Back</a>
+              </p>
+            </form>
+
+            <!-- Cloud Register Form (hidden initially) -->
+            <form id="cloud-register-form" style="display:none">
+              <h3 style="margin-bottom:var(--space-4)">Create Ironshelf Cloud Account</h3>
+              <div class="form-group">
+                <label>Email</label>
+                <input type="email" class="form-input" name="email" required>
+              </div>
+              <div class="form-group">
+                <label>Username</label>
+                <input type="text" class="form-input" name="username" required placeholder="2-32 chars, alphanumeric">
+              </div>
+              <div class="form-group">
+                <label>Password</label>
+                <input type="password" class="form-input" name="password" required minlength="8">
+              </div>
+              <div id="cloud-register-status" style="margin-bottom:var(--space-3)"></div>
+              <button type="submit" class="btn btn-primary" style="width:100%">Create Account</button>
+              <p style="text-align:center;margin-top:var(--space-2);font-size:var(--text-sm)">
+                Already have an account? <a href="#" id="cloud-login-link">Sign in</a>
+              </p>
+            </form>
+
+            <!-- Server Picker (shown after cloud auth) -->
+            <div id="cloud-server-picker" style="display:none">
+              <h3 style="margin-bottom:var(--space-4)">Your Servers</h3>
+              <div id="cloud-server-list"></div>
+            </div>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:var(--space-3);margin-bottom:var(--space-6)">
+            <hr style="flex:1;border:none;border-top:1px solid var(--color-border)">
+            <span style="color:var(--color-muted);font-size:var(--text-sm)">or connect directly</span>
+            <hr style="flex:1;border:none;border-top:1px solid var(--color-border)">
+          </div>
+
+          <!-- Direct Server URL -->
           <form id="connect-form">
             <div class="form-group">
               <label for="server-url">Server URL</label>
               <input type="url" class="form-input" id="server-url" name="server_url"
                      placeholder="https://books.example.com or http://192.168.1.50:10810"
-                     value="${escapeHtml(savedUrl)}" required autofocus>
+                     value="${escapeHtml(savedUrl)}">
               <p class="form-hint" style="margin-top:var(--space-1);font-size:var(--text-sm);color:var(--color-muted)">
-                The URL of your Ironshelf server. Ask your server admin if you don't know it.
+                Enter your server's URL to connect directly
               </p>
             </div>
             <div id="connect-status" style="margin-bottom:var(--space-4)"></div>
-            <button type="submit" class="btn btn-primary" style="width:100%" id="connect-btn">
-              Connect
+            <button type="submit" class="btn btn-ghost" style="width:100%" id="connect-btn">
+              Connect to Server
             </button>
           </form>
 
@@ -7837,6 +7902,162 @@
         connectBtn.textContent = 'Connect';
       }
     };
+
+    // --- Cloud auth event handlers ---
+
+    const cloudLoginView = document.getElementById('cloud-login-view');
+    const cloudLoginForm = document.getElementById('cloud-login-form');
+    const cloudRegisterForm = document.getElementById('cloud-register-form');
+    const cloudServerPicker = document.getElementById('cloud-server-picker');
+
+    function showView(view) {
+      cloudLoginView.style.display = view === 'buttons' ? '' : 'none';
+      cloudLoginForm.style.display = view === 'login' ? '' : 'none';
+      cloudRegisterForm.style.display = view === 'register' ? '' : 'none';
+      cloudServerPicker.style.display = view === 'servers' ? '' : 'none';
+    }
+
+    document.getElementById('cloud-signin-btn')?.addEventListener('click', () => showView('login'));
+    document.getElementById('cloud-register-link')?.addEventListener('click', (e) => { e.preventDefault(); showView('register'); });
+    document.getElementById('cloud-back-link')?.addEventListener('click', (e) => { e.preventDefault(); showView('buttons'); });
+    document.getElementById('cloud-login-link')?.addEventListener('click', (e) => { e.preventDefault(); showView('login'); });
+
+    // Cloud login
+    cloudLoginForm.onsubmit = async (e) => {
+      e.preventDefault();
+      const form = new FormData(e.target);
+      const statusDiv = document.getElementById('cloud-login-status');
+      statusDiv.innerHTML = '';
+
+      try {
+        const res = await fetch(`${CLOUD_API}/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email_or_username: form.get('email_or_username'),
+            password: form.get('password'),
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Login failed');
+
+        localStorage.setItem('ironshelf_cloud_token', data.data.token);
+        localStorage.setItem('ironshelf_cloud_username', data.data.username);
+
+        // Load user's servers
+        await loadCloudServers(data.data.token);
+      } catch (err) {
+        statusDiv.innerHTML = `<p style="color:var(--color-danger)">${escapeHtml(String(err.message))}</p>`;
+      }
+    };
+
+    // Cloud register
+    cloudRegisterForm.onsubmit = async (e) => {
+      e.preventDefault();
+      const form = new FormData(e.target);
+      const statusDiv = document.getElementById('cloud-register-status');
+      statusDiv.innerHTML = '';
+
+      try {
+        const res = await fetch(`${CLOUD_API}/auth/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: form.get('email'),
+            username: form.get('username'),
+            password: form.get('password'),
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Registration failed');
+
+        localStorage.setItem('ironshelf_cloud_token', data.data.token);
+        localStorage.setItem('ironshelf_cloud_username', data.data.username);
+
+        // Show servers (will be empty for new user)
+        await loadCloudServers(data.data.token);
+      } catch (err) {
+        statusDiv.innerHTML = `<p style="color:var(--color-danger)">${escapeHtml(String(err.message))}</p>`;
+      }
+    };
+
+    async function loadCloudServers(token) {
+      showView('servers');
+      const serverList = document.getElementById('cloud-server-list');
+      serverList.innerHTML = '<p style="color:var(--color-muted)">Loading servers...</p>';
+
+      try {
+        const [ownedRes, sharedRes] = await Promise.all([
+          fetch(`${CLOUD_API}/servers/mine`, { headers: { Authorization: `Bearer ${token}` } }),
+          fetch(`${CLOUD_API}/servers/shared`, { headers: { Authorization: `Bearer ${token}` } }),
+        ]);
+
+        const owned = (await ownedRes.json())?.data || [];
+        const shared = (await sharedRes.json())?.data || [];
+        const allServers = [...owned, ...shared];
+
+        if (allServers.length === 0) {
+          serverList.innerHTML = `
+            <div style="text-align:center;padding:var(--space-6);color:var(--color-muted)">
+              <p>No servers linked to your account yet.</p>
+              <p style="font-size:var(--text-sm);margin-top:var(--space-2)">
+                Install Ironshelf on your server, then claim it from Settings → Ironshelf Cloud.
+              </p>
+            </div>
+          `;
+          return;
+        }
+
+        serverList.innerHTML = allServers.map(server => `
+          <button class="cloud-server-btn" data-server-url="${escapeHtml(server.url)}" data-server-id="${escapeHtml(server.id)}" data-server-name="${escapeHtml(server.name)}">
+            <span class="cloud-server-name">${escapeHtml(server.name)}</span>
+            <span class="cloud-server-url">${escapeHtml(server.url)}</span>
+          </button>
+        `).join('');
+
+        // Click server → connect
+        serverList.querySelectorAll('.cloud-server-btn').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const serverUrl = btn.dataset.serverUrl;
+            const serverId = btn.dataset.serverId;
+            btn.disabled = true;
+            btn.querySelector('.cloud-server-url').textContent = 'Connecting...';
+
+            try {
+              // Get access token from cloud
+              const tokenRes = await fetch(`${CLOUD_API}/servers/${serverId}/token`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${token}` },
+              });
+              const tokenData = await tokenRes.json();
+              if (!tokenRes.ok) throw new Error(tokenData.error || 'Failed to get access token');
+
+              // Login to server with cloud token
+              const loginRes = await fetch(`${serverUrl}/api/v1/auth/cloud-login`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cloud_token: tokenData.data.token }),
+              });
+
+              if (!loginRes.ok) {
+                const err = await loginRes.json().catch(() => ({}));
+                throw new Error(err.error || 'Server rejected cloud login');
+              }
+
+              // Save server URL and reload
+              localStorage.setItem('ironshelf_server_url', serverUrl);
+              window.location.reload();
+            } catch (err) {
+              btn.disabled = false;
+              btn.querySelector('.cloud-server-url').textContent = err.message;
+              btn.querySelector('.cloud-server-url').style.color = 'var(--color-danger)';
+            }
+          });
+        });
+      } catch (err) {
+        serverList.innerHTML = `<p style="color:var(--color-danger)">Failed to load servers: ${escapeHtml(String(err.message))}</p>`;
+      }
+    }
   }
 
 })();
