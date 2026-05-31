@@ -8144,7 +8144,7 @@
               const loginRes = await fetch(`${serverUrl}/api/v1/auth/cloud-login`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cloud_token: tokenData.data.token }),
+                body: JSON.stringify({ cloud_token: tokenData.data.server_access_token }),
               });
 
               if (!loginRes.ok) {
