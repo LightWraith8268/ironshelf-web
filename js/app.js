@@ -246,6 +246,13 @@
     return response.json();
   }
 
+  // Cross-origin <img>/download requests can't send an Authorization header, so
+  // append the server token as a query param the server also accepts.
+  function mediaToken(separator = '?') {
+    const token = localStorage.getItem('ironshelf_server_token');
+    return token ? `${separator}access_token=${encodeURIComponent(token)}` : '';
+  }
+
   function apiGet(path) { return api(path); }
   function apiPost(path, body) { return api(path, { method: 'POST', body: JSON.stringify(body) }); }
   function apiPut(path, body) { return api(path, { method: 'PUT', body: JSON.stringify(body) }); }
@@ -2224,7 +2231,7 @@
         { label: book.title, path: `/book/${bookId}` },
       ];
 
-      const coverUrl = book.has_cover ? `${API}/books/${bookId}/cover` : '';
+      const coverUrl = book.has_cover ? `${API}/books/${bookId}/cover${mediaToken()}` : '';
       const formats = book.formats || [];
       const tags = book.tags || [];
       const genres = book.genres || [];
@@ -2290,7 +2297,7 @@
                   </a>`;
                 })()}
                 ${formats.map(f => `
-                  <a href="${API}/books/${bookId}/file?format=${f.kind}" class="btn btn-primary" download aria-label="Download ${f.kind} format">
+                  <a href="${API}/books/${bookId}/file?format=${f.kind}${mediaToken("&")}" class="btn btn-primary" download aria-label="Download ${f.kind} format">
                     ${icon('download', 16)} ${escapeHtml(f.kind.toUpperCase())}
                   </a>
                 `).join('')}
@@ -3410,7 +3417,7 @@
             <div class="continue-reading-row">
         `;
         for (const book of continueBooks) {
-          const coverUrl = book.has_cover ? `${API}/books/${book.id}/cover` : '';
+          const coverUrl = book.has_cover ? `${API}/books/${book.id}/cover${mediaToken()}` : '';
           const progressPercent = Math.round((book.progress || 0) * 100);
           bodyContent += `
             <div class="continue-reading-card" data-read-book-id="${book.id}" data-read-format="${book.format || 'epub'}" role="link" tabindex="0" aria-label="Continue reading ${escapeHtml(book.title)}">
@@ -3895,7 +3902,7 @@
       } else {
         bodyContent += `<div class="grid grid-books">`;
         for (const book of books) {
-          const coverUrl = book.has_cover ? `${API}/books/${book.id}/cover` : '';
+          const coverUrl = book.has_cover ? `${API}/books/${book.id}/cover${mediaToken()}` : '';
           bodyContent += `
             <div class="book-card collection-book-card" data-book-id="${book.id}" role="link" tabindex="0" aria-label="${escapeHtml(book.title)}">
               <button class="remove-from-collection" data-remove-book-id="${book.id}" aria-label="Remove ${escapeHtml(book.title)} from collection" title="Remove from collection">
@@ -4440,7 +4447,7 @@
   // --- Helpers ---
 
   function renderBookCard(book, showSeriesIndex = false) {
-    const coverUrl = book.has_cover ? `${API}/books/${book.id}/cover` : '';
+    const coverUrl = book.has_cover ? `${API}/books/${book.id}/cover${mediaToken()}` : '';
     return `
       <div class="book-card" data-book-id="${book.id}" role="link" tabindex="0" aria-label="${escapeHtml(book.title)}">
         ${showSeriesIndex && book.series_index ? `<span class="series-badge">#${book.series_index}</span>` : ''}
@@ -4825,7 +4832,7 @@
         bodyContent += `<div class="queue-list" id="queue-list">`;
         for (let i = 0; i < queueItems.length; i++) {
           const queueItem = queueItems[i];
-          const coverUrl = queueItem.has_cover ? `${API}/books/${queueItem.book_id || queueItem.id}/cover` : '';
+          const coverUrl = queueItem.has_cover ? `${API}/books/${queueItem.book_id || queueItem.id}/cover${mediaToken()}` : '';
           bodyContent += `
             <div class="queue-item" data-queue-id="${queueItem.id}" data-queue-position="${i}" draggable="true">
               <div class="queue-item-drag" aria-label="Drag to reorder" title="Drag to reorder">
@@ -5098,7 +5105,7 @@
           <h3 class="mt-6 mb-4">Completed</h3>
           <div class="year-in-books-grid">
             ${completedBooks.map(completedBook => {
-              const completedCoverUrl = completedBook.has_cover ? `${API}/books/${completedBook.id}/cover` : '';
+              const completedCoverUrl = completedBook.has_cover ? `${API}/books/${completedBook.id}/cover${mediaToken()}` : '';
               return `
                 <div class="mini-cover" data-book-id="${completedBook.id}" role="link" tabindex="0" title="${escapeHtml(completedBook.title || '')}">
                   ${completedCoverUrl ? `<img src="${completedCoverUrl}" alt="" loading="lazy">` : `<div style="width:100%;height:100%;background:var(--color-surface-active);display:flex;align-items:center;justify-content:center;color:var(--color-muted)">${Icons.book}</div>`}
@@ -6139,7 +6146,7 @@
               </div>
               <div class="duplicate-books-row">
                 ${duplicateBooks.map(duplicateBook => {
-                  const duplicateCoverUrl = duplicateBook.has_cover ? `${API}/books/${duplicateBook.id}/cover` : '';
+                  const duplicateCoverUrl = duplicateBook.has_cover ? `${API}/books/${duplicateBook.id}/cover${mediaToken()}` : '';
                   return `
                     <div class="duplicate-book-card">
                       <div class="book-cover" style="height:200px;width:133px;margin:0 auto var(--space-3)">
@@ -6261,7 +6268,7 @@
                       clearInterval(conversionPollTimer); conversionPollTimer = null;
                       statusEl.innerHTML = `
                         <span style="color:var(--color-success)">Conversion complete!</span>
-                        <a href="${API}/books/${bookId}/file?format=${targetFormat}" class="btn btn-primary btn-sm" download>${icon('download', 14)} Download ${targetFormat.toUpperCase()}</a>
+                        <a href="${API}/books/${bookId}/file?format=${targetFormat}${mediaToken("&")}" class="btn btn-primary btn-sm" download>${icon('download', 14)} Download ${targetFormat.toUpperCase()}</a>
                       `;
                       toast('Format conversion complete', 'success');
                     } else if (jobStatus?.status === 'failed') {
@@ -6280,7 +6287,7 @@
                 // Immediate result
                 statusEl.innerHTML = `
                   <span style="color:var(--color-success)">Conversion complete!</span>
-                  <a href="${API}/books/${bookId}/file?format=${targetFormat}" class="btn btn-primary btn-sm" download>${icon('download', 14)} Download ${targetFormat.toUpperCase()}</a>
+                  <a href="${API}/books/${bookId}/file?format=${targetFormat}${mediaToken("&")}" class="btn btn-primary btn-sm" download>${icon('download', 14)} Download ${targetFormat.toUpperCase()}</a>
                 `;
                 toast('Format conversion complete', 'success');
               }
@@ -7746,7 +7753,7 @@
         bodyContent += `<p style="color:var(--color-text-dim);margin-bottom:var(--space-6)">These books have no description. Click a book to view it, then use "Enrich Metadata" to fetch information from Google Books or Open Library.</p>`;
         bodyContent += '<div class="grid grid-4">';
         for (const book of allBooks) {
-          const coverUrl = book.has_cover ? `${API}/books/${book.id}/cover` : '';
+          const coverUrl = book.has_cover ? `${API}/books/${book.id}/cover${mediaToken()}` : '';
           const authorNames = (book.author_names || []).join(', ');
           bodyContent += `
             <div class="book-card" data-book-id="${book.id}" role="link" tabindex="0">
