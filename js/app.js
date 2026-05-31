@@ -5,10 +5,23 @@
 (() => {
   'use strict';
 
-  // Hosted mode: server URL from localStorage, or relative for embedded mode
-  const HOSTED_MODE = window.location.hostname !== 'localhost' && !window.location.port;
-  const SERVER_URL = localStorage.getItem('ironshelf_server_url') || '';
-  const API = SERVER_URL ? `${SERVER_URL}/api/v1` : '/api/v1';
+  // Hosted mode: this same UI runs both embedded in the server (same-origin,
+  // cookie auth) and on the hosted dashboard (cross-origin, Bearer-token auth).
+  // ironshelf-web's index.html sets window.IRONSHELF_HOSTED = true.
+  const HOSTED = !!window.IRONSHELF_HOSTED;
+  const SERVER_URL = HOSTED ? (localStorage.getItem('ironshelf_server_url') || '') : '';
+  const API = (HOSTED && SERVER_URL) ? `${SERVER_URL}/api/v1` : '/api/v1';
+  const CLOUD_API = 'https://ironshelf-cloud.padragantrbs.workers.dev';
+
+  // Cross-origin media (<img>/downloads) can't set an Authorization header, so
+  // append the server token as a query param the server also accepts. Empty
+  // (no-op) on the same-origin server UI.
+  function mediaToken(separator = '?') {
+    if (!HOSTED) return '';
+    const token = localStorage.getItem('ironshelf_server_token');
+    return token ? `${separator}access_token=${encodeURIComponent(token)}` : '';
+  }
+
   let currentUser = null;
   let sidebarOpen = false;
 
@@ -19,6 +32,21 @@
   let activeScanLibraryId = null;
   let scanPollTimer = null;
   let conversionPollTimer = null;
+
+  // --- Server Version (fetched once from /health) ---
+  let cachedServerVersion = null;
+
+  // --- Server settings (feature toggles, fetched once) ---
+  let cachedServerSettings = null;
+  async function getServerSettings(forceRefresh = false) {
+    if (cachedServerSettings && !forceRefresh) return cachedServerSettings;
+    try {
+      cachedServerSettings = await apiGet('/server/settings');
+    } catch (_) {
+      cachedServerSettings = { author_images_enabled: true };
+    }
+    return cachedServerSettings;
+  }
 
   // --- Navigation Generation Counter (race condition guard) ---
   // Incremented on every route change. Async render functions capture it
@@ -162,7 +190,11 @@
     const allowedAttributes = { a: ['href', 'title'], span: ['class'], div: ['class'] };
 
     const parser = new DOMParser();
-    const doc = parser.parseFromString(html, 'text/html');
+    const doc = parser.parseFromString(String(html), 'text/html');
+
+    // Some inputs (e.g. <frameset> or otherwise malformed markup) yield a
+    // document with no body. Fall back to escaped plain text instead of crashing.
+    if (!doc || !doc.body) return escapeHtml(String(html));
 
     function cleanNode(node) {
       if (node.nodeType === Node.TEXT_NODE) return;
@@ -200,7 +232,12 @@
       }
     }
 
-    cleanNode(doc.body);
+    // Clean the body's children, not the body node itself: cleanNode replaces
+    // any element whose tag is not allowed, and 'body' is not in allowedTags,
+    // so cleaning the body would delete it and null out doc.body.
+    for (const child of [...doc.body.childNodes]) {
+      cleanNode(child);
+    }
     return doc.body.innerHTML;
   }
 
@@ -219,10 +256,11 @@
   // --- API Helpers ---
 
   async function api(path, options = {}) {
-    // The hosted UI is cross-origin to the server, so cookies don't apply —
-    // authenticate with the session token (or API key) as a Bearer header.
-    const serverToken = localStorage.getItem('ironshelf_server_token');
+    // Hosted UI is cross-origin → authenticate with the stored server token as
+    // a Bearer header (cookies don't cross origins). Server UI uses the cookie.
+    const serverToken = HOSTED ? localStorage.getItem('ironshelf_server_token') : null;
     const response = await fetch(`${API}${path}`, {
+      credentials: 'same-origin',
       headers: {
         'Content-Type': 'application/json',
         ...(serverToken ? { 'Authorization': `Bearer ${serverToken}` } : {}),
@@ -246,18 +284,35 @@
     return response.json();
   }
 
-  // Cross-origin <img>/download requests can't send an Authorization header, so
-  // append the server token as a query param the server also accepts.
-  function mediaToken(separator = '?') {
-    const token = localStorage.getItem('ironshelf_server_token');
-    return token ? `${separator}access_token=${encodeURIComponent(token)}` : '';
-  }
-
   function apiGet(path) { return api(path); }
   function apiPost(path, body) { return api(path, { method: 'POST', body: JSON.stringify(body) }); }
   function apiPut(path, body) { return api(path, { method: 'PUT', body: JSON.stringify(body) }); }
   function apiPatch(path, body) { return api(path, { method: 'PATCH', body: JSON.stringify(body) }); }
   function apiDelete(path) { return api(path, { method: 'DELETE' }); }
+
+  // --- Server Version ---
+
+  async function fetchServerVersion(forceRefresh = false) {
+    if (cachedServerVersion && !forceRefresh) return cachedServerVersion;
+    try {
+      const healthResponse = await fetch('/health');
+      if (healthResponse.ok) {
+        const healthData = await healthResponse.json();
+        cachedServerVersion = healthData.version || null;
+        updateSidebarVersion();
+      }
+    } catch {
+      // Silently ignore — version display is non-critical.
+    }
+    return cachedServerVersion;
+  }
+
+  function updateSidebarVersion() {
+    const versionElement = document.getElementById('sidebar-version');
+    if (versionElement && cachedServerVersion) {
+      versionElement.textContent = `v${cachedServerVersion}`;
+    }
+  }
 
   // --- Toast System ---
 
@@ -775,6 +830,8 @@
       home: renderHome,
       login: renderLogin,
       register: renderRegister,
+      'cloud-login': renderCloudLogin,
+      'cloud-servers': renderCloudServerPicker,
       libraries: renderLibraries,
       library: () => renderLibrary(parsed.params.id),
       author: () => renderAuthor(parsed.params.id),
@@ -783,8 +840,7 @@
       read: () => openReader(parsed.params.id, detectReaderFormat(parsed.params.sub) || 'epub'),
       collections: renderCollections,
       collection: () => renderCollectionDetail(parsed.params.id),
-      connect: renderConnectServer,
-      settings: renderSettings,
+      settings: () => renderSettings(parsed.params.id),
       users: renderUsers,
       stats: renderStats,
       activity: renderActivity,
@@ -1006,36 +1062,77 @@
   function renderShell(bodyContent, activePage = '') {
     const app = document.getElementById('app');
 
-    const navItems = [
+    const mainNavItems = [
       { id: 'home', label: 'Home', icon: 'home', path: '/' },
-      { id: 'libraries', label: 'Libraries', icon: 'library', path: '/libraries' },
       { id: 'genres', label: 'Genres', icon: 'collection', path: '/genres' },
       { id: 'collections', label: 'Collections', icon: 'collection', path: '/collections' },
       { id: 'queue', label: 'Queue', icon: 'clock', path: '/queue' },
       { id: 'highlights', label: 'Highlights', icon: 'edit', path: '/highlights' },
       { id: 'bookmarks', label: 'Bookmarks', icon: 'bookmark', path: '/bookmarks' },
-      { id: 'settings', label: 'Settings', icon: 'settings', path: '/settings' },
+      { id: 'activity', label: 'Activity', icon: 'activity', path: '/activity' },
     ];
 
-    navItems.push({ id: 'activity', label: 'Activity', icon: 'activity', path: '/activity' });
-
+    const adminNavItems = [];
     if (hasPermission('manage_library')) {
-      navItems.push({ id: 'stats', label: 'Stats', icon: 'barChart', path: '/stats' });
-      navItems.push({ id: 'acquisition', label: 'Acquisition', icon: 'package', path: '/acquisition' });
+      adminNavItems.push({ id: 'stats', label: 'Stats', icon: 'barChart', path: '/stats' });
+      adminNavItems.push({ id: 'acquisition', label: 'Acquisition', icon: 'package', path: '/acquisition' });
     }
-
     if (hasPermission('manage_users')) {
-      navItems.push({ id: 'users', label: 'Users', icon: 'users', path: '/users' });
+      adminNavItems.push({ id: 'users', label: 'Users', icon: 'users', path: '/users' });
     }
 
-    const navHtml = navItems.map(item => `
+    const renderNavItem = (item) => `
       <a href="#${item.path}" class="${activePage === item.id ? 'active' : ''}" aria-current="${activePage === item.id ? 'page' : 'false'}">
         ${icon(item.icon)}
         <span>${item.label}</span>
       </a>
-    `).join('');
+    `;
 
-    const bottomNavHtml = navItems.map(item => `
+    // Pinned libraries sit directly below Home, above the rest of the nav.
+    const pinnedLibraries = getPinnedLibraries();
+    const pinnedLibrariesHtml = pinnedLibraries.length === 0 ? '' : `
+      <div class="sidebar-section-label">Libraries</div>
+      ${pinnedLibraries.map(lib => {
+        const sourceIcon = lib.source_kind === 'calibre' ? 'book' : 'folder';
+        return `<a href="#/library/${lib.id}" aria-label="${escapeHtml(lib.name)} library">
+          ${icon(sourceIcon)}
+          <span>${escapeHtml(lib.name)}</span>
+        </a>`;
+      }).join('')}
+    `;
+
+    const navHtml = mainNavItems
+      .map((item, index) => index === 0 ? renderNavItem(item) + pinnedLibrariesHtml : renderNavItem(item))
+      .join('');
+
+    const isAdminActive = adminNavItems.some(item => activePage === item.id);
+    const adminSectionHtml = adminNavItems.length > 0 ? `
+      <div class="sidebar-admin-section">
+        <button class="sidebar-admin-toggle${isAdminActive ? ' open' : ''}" id="sidebar-admin-toggle" aria-expanded="${isAdminActive ? 'true' : 'false'}">
+          ${icon('shield', 16)}
+          <span>Admin</span>
+          <span class="sidebar-admin-chevron">${Icons.chevronDown}</span>
+        </button>
+        <nav class="sidebar-admin-nav${isAdminActive ? ' expanded' : ''}" id="sidebar-admin-nav">
+          ${adminNavItems.map(item => `
+            <a href="#${item.path}" class="${activePage === item.id ? 'active' : ''}" aria-current="${activePage === item.id ? 'page' : 'false'}">
+              ${icon(item.icon)}
+              <span>${item.label}</span>
+            </a>
+          `).join('')}
+        </nav>
+      </div>
+    ` : '';
+
+    // Bottom nav: only essential items for mobile
+    const bottomNavItems = [
+      { id: 'home', label: 'Home', icon: 'home', path: '/' },
+      { id: 'collections', label: 'Collections', icon: 'collection', path: '/collections' },
+      { id: 'queue', label: 'Queue', icon: 'clock', path: '/queue' },
+      { id: 'settings', label: 'Settings', icon: 'settings', path: '/settings' },
+    ];
+
+    const bottomNavHtml = bottomNavItems.map(item => `
       <a href="#${item.path}" class="${activePage === item.id ? 'active' : ''}" aria-label="${item.label}">
         <span class="nav-icon">${Icons[item.icon]}</span>
         <span>${item.label}</span>
@@ -1069,28 +1166,17 @@
             <span>Search...</span>
             <span class="search-slash-hint">/</span>
           </button>
-          <div class="sidebar-section-label">Navigation</div>
-          <nav class="sidebar-nav">
+          <nav class="sidebar-nav" id="sidebar-main-nav">
             ${navHtml}
           </nav>
-          ${(() => {
-            const pinnedLibraries = getPinnedLibraries();
-            if (pinnedLibraries.length === 0) return '';
-            return `
-              <div class="sidebar-section-label">Libraries</div>
-              <nav class="sidebar-nav sidebar-pinned-libraries">
-                ${pinnedLibraries.map(lib => {
-                  const sourceIcon = lib.source_kind === 'calibre' ? 'book' : 'folder';
-                  return `<a href="#/library/${lib.id}" class="" aria-label="${escapeHtml(lib.name)} library">
-                    ${icon(sourceIcon)}
-                    <span>${escapeHtml(lib.name)}</span>
-                  </a>`;
-                }).join('')}
-              </nav>
-            `;
-          })()}
-          <div class="sidebar-footer">
-            <div class="user-info">
+          ${adminSectionHtml}
+          <div class="sidebar-spacer"></div>
+          <div class="sidebar-bottom">
+            <a href="#/settings" class="sidebar-settings-btn${activePage === 'settings' ? ' active' : ''}" aria-label="Settings" title="Settings">
+              <span class="nav-icon">${Icons.settings}</span>
+            </a>
+            <span class="sidebar-version-label" id="sidebar-version">${cachedServerVersion ? `v${cachedServerVersion}` : ''}</span>
+            <div class="sidebar-bottom-user">
               <div class="user-avatar" aria-hidden="true">${userInitial}</div>
               <span class="user-name">${currentUser ? escapeHtml(currentUser.username) : ''}</span>
             </div>
@@ -1121,7 +1207,7 @@
     // Event bindings
     document.getElementById('logout-btn')?.addEventListener('click', async () => {
       await apiPost('/auth/logout', {}).catch(() => {});
-      localStorage.removeItem('ironshelf_server_token');
+      if (HOSTED) localStorage.removeItem('ironshelf_server_token');
       currentUser = null;
       stopNotificationPolling();
       closeNotificationPanel();
@@ -1134,6 +1220,17 @@
     document.getElementById('notification-bell')?.addEventListener('click', (e) => {
       e.stopPropagation();
       openNotificationPanel();
+    });
+
+    // Admin section toggle
+    document.getElementById('sidebar-admin-toggle')?.addEventListener('click', () => {
+      const adminNav = document.getElementById('sidebar-admin-nav');
+      const adminToggle = document.getElementById('sidebar-admin-toggle');
+      if (adminNav && adminToggle) {
+        const isExpanded = adminNav.classList.toggle('expanded');
+        adminToggle.classList.toggle('open', isExpanded);
+        adminToggle.setAttribute('aria-expanded', String(isExpanded));
+      }
     });
 
     // Update notification badge on shell render
@@ -1185,6 +1282,18 @@
       <a href="${API}/auth/oidc/login" class="btn btn-sso">${icon('shield', 18)} Sign in with SSO</a>
     ` : '';
 
+    // Check if server is claimed (cloud login available)
+    let cloudLoginHtml = '';
+    try {
+      const claimStatus = await fetch(`${API}/auth/claim-status`).then(r => r.ok ? r.json() : null).catch(() => null);
+      if (claimStatus?.is_claimed && claimStatus?.cloud_service_url) {
+        cloudLoginHtml = `
+          <div class="login-divider">or</div>
+          <a href="#/cloud-login" class="btn btn-cloud">${icon('globe', 18)} Sign in with Ironshelf Cloud</a>
+        `;
+      }
+    } catch { /* ignore */ }
+
     document.getElementById('app').innerHTML = `
       <div class="login-page">
         <div class="login-card">
@@ -1205,6 +1314,7 @@
             <button type="submit" class="btn btn-primary btn-lg">Sign In</button>
           </form>
           ${oidcButtonHtml}
+          ${cloudLoginHtml}
           ${registerLinkHtml}
         </div>
       </div>
@@ -1224,7 +1334,8 @@
           username: document.getElementById('login-username').value,
           password: document.getElementById('login-password').value,
         });
-        if (loginResult?.session_id) {
+        // Hosted UI is cross-origin: keep the session as a Bearer token.
+        if (HOSTED && loginResult?.session_id) {
           localStorage.setItem('ironshelf_server_token', loginResult.session_id);
         }
         await checkAuth();
@@ -1311,7 +1422,7 @@
   async function renderLibraries() {
     if (!await checkAuth()) return;
     setTitle(['Libraries']);
-    breadcrumbTrail = [{ label: 'Libraries', path: '/libraries' }];
+    breadcrumbTrail = [{ label: 'Settings', path: '/settings' }, { label: 'Libraries', path: '/libraries' }];
 
     // Show skeleton
     renderShell(`
@@ -1319,7 +1430,7 @@
         <h1>Libraries</h1>
       </div>
       ${skeletonList(3)}
-    `, 'libraries');
+    `, 'settings');
 
     try {
       const libraries = await apiGet('/libraries');
@@ -1365,7 +1476,7 @@
         bodyContent += '</div>';
       }
 
-      renderShell(bodyContent, 'libraries');
+      renderShell(bodyContent, 'settings');
 
       // Bind events
       document.querySelectorAll('[data-library-id]').forEach(card => {
@@ -1394,7 +1505,7 @@
       document.getElementById('add-library-btn')?.addEventListener('click', showAddLibraryModal);
       document.getElementById('add-library-empty-btn')?.addEventListener('click', showAddLibraryModal);
     } catch (err) {
-      renderShell(renderError('Failed to load libraries', err.message, () => renderLibraries()), 'libraries');
+      renderShell(renderError('Failed to load libraries', err.message, () => renderLibraries()), 'settings');
     }
   }
 
@@ -1983,7 +2094,7 @@
         bodyContent += renderPagination(libraryPage, totalPages);
       }
 
-      renderShell(bodyContent, 'libraries');
+      renderShell(bodyContent, 'settings');
 
       // Bind
       document.querySelectorAll('[data-author-id]').forEach(item => {
@@ -2056,8 +2167,20 @@
         { label: author.name, path: `/author/${authorId}` },
       ];
 
+      const serverSettings = await getServerSettings();
+      const authorInitial = (author.name || '?').trim().charAt(0).toUpperCase() || '?';
+      const authorAvatarHtml = `
+        <div class="author-avatar" id="author-avatar">
+          <span class="author-avatar-initial">${escapeHtml(authorInitial)}</span>
+          ${serverSettings.author_images_enabled
+            ? `<img class="author-avatar-img" id="author-avatar-img" alt="" src="${API}/authors/${authorId}/photo">`
+            : ''}
+        </div>
+      `;
+
       let bodyContent = `
-        <div class="page-header">
+        <div class="page-header author-page-header">
+          ${authorAvatarHtml}
           <h1>${escapeHtml(author.name)}</h1>
         </div>
       `;
@@ -2112,7 +2235,15 @@
         }
       }
 
-      renderShell(bodyContent, 'libraries');
+      renderShell(bodyContent, 'settings');
+
+      // Reveal the portrait only once it loads; drop it (showing the initial)
+      // on error. Bound here because CSP blocks inline event handlers.
+      const authorAvatarImg = document.getElementById('author-avatar-img');
+      if (authorAvatarImg) {
+        authorAvatarImg.addEventListener('load', () => authorAvatarImg.classList.add('loaded'));
+        authorAvatarImg.addEventListener('error', () => authorAvatarImg.remove());
+      }
 
       // Bind
       document.querySelectorAll('[data-series-id]').forEach(item => {
@@ -2185,7 +2316,7 @@
         bodyContent += `</div>`;
       }
 
-      renderShell(bodyContent, 'libraries');
+      renderShell(bodyContent, 'settings');
 
       document.querySelectorAll('[data-book-id]').forEach(card => {
         const handler = () => navigateTo(`/book/${card.dataset.bookId}`);
@@ -2338,64 +2469,76 @@
         </div>
       `;
 
-      renderShell(bodyContent, 'libraries');
+      renderShell(bodyContent, 'settings');
 
-      // Cover zoom
-      const coverTrigger = document.getElementById('cover-zoom-trigger');
-      if (coverTrigger && coverUrl) {
-        const openZoom = () => {
-          const overlay = document.createElement('div');
-          overlay.className = 'cover-zoom-overlay';
-          overlay.setAttribute('role', 'dialog');
-          overlay.setAttribute('aria-label', 'Enlarged cover image');
-          overlay.innerHTML = `<img src="${coverUrl}" alt="Cover of ${escapeHtml(book.title)}">`;
-          document.body.appendChild(overlay);
+      // Post-render event bindings — wrapped in try-catch so one failed
+      // binding does not kill the entire page render.
+      try {
+        // Cover zoom
+        const coverTrigger = document.getElementById('cover-zoom-trigger');
+        if (coverTrigger && coverUrl) {
+          const openZoom = () => {
+            const overlay = document.createElement('div');
+            overlay.className = 'cover-zoom-overlay';
+            overlay.setAttribute('role', 'dialog');
+            overlay.setAttribute('aria-label', 'Enlarged cover image');
+            overlay.innerHTML = `<img src="${coverUrl}" alt="Cover of ${escapeHtml(book.title)}">`;
+            document.body.appendChild(overlay);
 
-          const closeZoom = () => overlay.remove();
-          overlay.addEventListener('click', closeZoom);
-          document.addEventListener('keydown', function escHandler(e) {
-            if (e.key === 'Escape') { closeZoom(); document.removeEventListener('keydown', escHandler); }
+            const closeZoom = () => overlay.remove();
+            overlay.addEventListener('click', closeZoom);
+            document.addEventListener('keydown', function escHandler(e) {
+              if (e.key === 'Escape') { closeZoom(); document.removeEventListener('keydown', escHandler); }
+            });
+          };
+          coverTrigger.addEventListener('click', openZoom);
+          coverTrigger.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openZoom(); } });
+        }
+
+        // Bind add-to-collection
+        bindAddToCollectionButton(bookId);
+
+        // Bind add-to-queue
+        document.getElementById('add-to-queue-btn')?.addEventListener('click', async () => {
+          const queueBtn = document.getElementById('add-to-queue-btn');
+          if (queueBtn) queueBtn.disabled = true;
+          try {
+            await apiPost('/me/queue', { book_id: bookId });
+            toast('Added to reading queue', 'success');
+            if (queueBtn) queueBtn.innerHTML = `${icon('check', 16)} In Queue`;
+          } catch (queueError) {
+            toast(queueError.message, 'error');
+            if (queueBtn) queueBtn.disabled = false;
+          }
+        });
+
+        // Bind enrich metadata
+        document.getElementById('enrich-metadata-btn')?.addEventListener('click', () => showMetadataSearchModal(bookId));
+
+        // Bind find-more-by-author
+        const findMoreAuthorBtn = document.getElementById('find-more-author-btn');
+        if (findMoreAuthorBtn && book.author_names && book.author_names.length > 0) {
+          findMoreAuthorBtn.addEventListener('click', () => {
+            const authorName = book.author_names[0];
+            navigateTo(`/acquisition/search?author=${encodeURIComponent(authorName)}`);
           });
-        };
-        coverTrigger.addEventListener('click', openZoom);
-        coverTrigger.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openZoom(); } });
+        }
+      } catch (bindingError) {
+        console.warn('Book detail: non-critical binding failed:', bindingError);
       }
 
-      // Bind add-to-collection
-      bindAddToCollectionButton(bookId);
-
-      // Bind add-to-queue
-      document.getElementById('add-to-queue-btn')?.addEventListener('click', async () => {
-        const queueBtn = document.getElementById('add-to-queue-btn');
-        queueBtn.disabled = true;
-        try {
-          await apiPost('/me/queue', { book_id: bookId });
-          toast('Added to reading queue', 'success');
-          queueBtn.innerHTML = `${icon('check', 16)} In Queue`;
-        } catch (err) {
-          toast(err.message, 'error');
-          queueBtn.disabled = false;
-        }
+      // Render ratings & reviews below description (async, independent)
+      renderBookRatingsAndReviews(bookId, '.book-detail-info').catch(ratingsError => {
+        console.warn('Book detail: ratings/reviews failed:', ratingsError);
       });
 
-      // Bind enrich metadata
-      document.getElementById('enrich-metadata-btn')?.addEventListener('click', () => showMetadataSearchModal(bookId));
-
-      // Bind find-more-by-author
-      const findMoreAuthorBtn = document.getElementById('find-more-author-btn');
-      if (findMoreAuthorBtn && book.author_names && book.author_names.length > 0) {
-        findMoreAuthorBtn.addEventListener('click', () => {
-          const authorName = book.author_names[0];
-          navigateTo(`/acquisition/search?author=${encodeURIComponent(authorName)}`);
-        });
-      }
-
-      // Render ratings & reviews below description
-      renderBookRatingsAndReviews(bookId, '.book-detail-info');
-
-      // Render conversion button if converters available
-      renderConversionButton(bookId, '#convert-btn-container');
+      // Render conversion button if converters available (async, independent)
+      renderConversionButton(bookId, '#convert-btn-container').catch(conversionError => {
+        console.warn('Book detail: conversion button failed:', conversionError);
+      });
     } catch (err) {
+      console.error('renderBook crash:', err);
+      console.error('renderBook stack:', err?.stack);
       const errorMessage = (err && typeof err.message === 'string') ? err.message : String(err || 'Unknown error');
       renderShell(renderError('Failed to load book', errorMessage, () => renderBook(bookId)), 'libraries');
     }
@@ -2403,7 +2546,43 @@
 
   // --- Settings ---
 
-  async function renderSettings() {
+  // Plex-style settings categories. Order shown in the left nav; categories
+  // with no present sections (e.g. owner-only ones for a normal user) are
+  // automatically omitted.
+  const SETTINGS_CATEGORY_ORDER = ['general', 'library', 'network', 'devices', 'users', 'account', 'notifications', 'reader', 'data'];
+  const SETTINGS_CATEGORY_META = {
+    general: { label: 'General', icon: 'settings' },
+    library: { label: 'Library', icon: 'library' },
+    network: { label: 'Cloud & Remote Access', icon: 'globe' },
+    devices: { label: 'Devices & API', icon: 'link' },
+    users: { label: 'Users', icon: 'users' },
+    account: { label: 'Account', icon: 'lock' },
+    notifications: { label: 'Notifications', icon: 'bell' },
+    reader: { label: 'Reader', icon: 'book' },
+    data: { label: 'Data', icon: 'download' },
+  };
+
+  function setupSettingsNav(requestedCategory) {
+    const nav = document.getElementById('settings-nav');
+    if (!nav) return;
+    const sections = Array.from(document.querySelectorAll('.settings-content [data-cat]'));
+    const present = [];
+    sections.forEach((section) => {
+      if (!present.includes(section.dataset.cat)) present.push(section.dataset.cat);
+    });
+    const ordered = SETTINGS_CATEGORY_ORDER.filter((cat) => present.includes(cat));
+    if (ordered.length === 0) return;
+    const activeCategory = ordered.includes(requestedCategory) ? requestedCategory : ordered[0];
+
+    nav.innerHTML = ordered.map((cat) => {
+      const meta = SETTINGS_CATEGORY_META[cat] || { label: cat, icon: 'settings' };
+      return `<a href="#/settings/${cat}" class="settings-nav-item${cat === activeCategory ? ' active' : ''}">${icon(meta.icon, 18)}<span>${escapeHtml(meta.label)}</span></a>`;
+    }).join('');
+
+    sections.forEach((section) => { section.hidden = section.dataset.cat !== activeCategory; });
+  }
+
+  async function renderSettings(activeCategory) {
     if (!await checkAuth()) return;
     setTitle(['Settings']);
     breadcrumbTrail = [{ label: 'Settings', path: '/settings' }];
@@ -2415,25 +2594,77 @@
 
     try {
       const keys = await apiGet('/auth/api-keys').catch(() => []);
-
-      const connectedServerUrl = localStorage.getItem('ironshelf_server_url');
+      const serverSettings = await getServerSettings(true);
 
       let bodyContent = `
         <div class="page-header"><h1>Settings</h1></div>
 
-        ${connectedServerUrl ? `
-        <div class="settings-section">
-          <h3>${icon('server', 20)} Connected Server</h3>
-          <p class="description">You are connected to a remote Ironshelf server.</p>
-          <div style="display:flex;align-items:center;gap:var(--space-3);margin-top:var(--space-3)">
-            <code style="flex:1;padding:var(--space-2) var(--space-3);background:var(--color-bg);border-radius:var(--radius-md);font-size:var(--text-sm)">${escapeHtml(connectedServerUrl)}</code>
-            <button class="btn btn-danger" id="disconnect-server-btn">Disconnect</button>
+        <div class="settings-layout">
+        <aside class="settings-nav" id="settings-nav"></aside>
+        <div class="settings-content">
+
+        <div class="settings-section" id="libraries-section" data-cat="library">
+          <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('library', 20)} Libraries</h3>
+          <p class="description">Browse, add, scan, and manage your libraries. Pin a library to keep it in the sidebar for quick access.</p>
+          <a href="#/libraries" class="btn btn-primary">${icon('library', 16)} Manage Libraries</a>
+        </div>
+
+        ${currentUser?.is_owner ? `
+        <div class="settings-section" data-cat="library" id="calibre-writeback-section">
+          <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('database', 20)} Calibre Write-Back</h3>
+          <p class="description">Optionally write applied metadata changes back to your Calibre library. Direct database writes are never used — choose Calibre's <code>calibredb</code> CLI or its Content Server API. Leave off to keep changes as Ironshelf-only overrides.</p>
+          <div class="form-group">
+            <label class="form-label" for="calibre-wb-mode">Mode</label>
+            <select class="form-input" id="calibre-wb-mode" style="width:auto;min-width:300px">
+              <option value="none" ${serverSettings.calibre_writeback_mode === 'none' ? 'selected' : ''}>Off — Ironshelf overrides only</option>
+              <option value="calibredb" ${serverSettings.calibre_writeback_mode === 'calibredb' ? 'selected' : ''}>calibredb CLI</option>
+              <option value="content_server" ${serverSettings.calibre_writeback_mode === 'content_server' ? 'selected' : ''}>Calibre Content Server API</option>
+            </select>
           </div>
+          <div id="calibre-wb-calibredb-fields" class="${serverSettings.calibre_writeback_mode === 'calibredb' ? '' : 'hidden'}">
+            <div class="form-group">
+              <label class="form-label" for="calibre-wb-path">calibredb path</label>
+              <input type="text" class="form-input" id="calibre-wb-path" placeholder="calibredb" value="${escapeHtml(serverSettings.calibredb_path || '')}">
+              <p class="form-hint">Leave as <code>calibredb</code> if it's on the server's PATH. The Calibre desktop app must be closed while writing (it locks the library).</p>
+            </div>
+          </div>
+          <div id="calibre-wb-cs-fields" class="${serverSettings.calibre_writeback_mode === 'content_server' ? '' : 'hidden'}">
+            <div class="form-group">
+              <label class="form-label" for="calibre-wb-url">Content Server URL</label>
+              <input type="url" class="form-input" id="calibre-wb-url" placeholder="http://localhost:8080" value="${escapeHtml(serverSettings.calibre_cs_url || '')}">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="calibre-wb-library">Library ID</label>
+              <input type="text" class="form-input" id="calibre-wb-library" placeholder="Calibre_Library" value="${escapeHtml(serverSettings.calibre_cs_library_id || '')}">
+              <p class="form-hint">The library name as it appears in the Content Server URL (e.g. <code>Calibre_Library</code>).</p>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="calibre-wb-username">Username</label>
+              <input type="text" class="form-input" id="calibre-wb-username" autocomplete="off" value="${escapeHtml(serverSettings.calibre_cs_username || '')}">
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="calibre-wb-password">Password</label>
+              <input type="password" class="form-input" id="calibre-wb-password" autocomplete="new-password" placeholder="${serverSettings.calibre_cs_password_set ? '•••••••• (unchanged)' : ''}">
+              <p class="form-hint">Leave blank to keep the current password. Content Server must allow writes (run with user accounts that have write permission).</p>
+            </div>
+          </div>
+          <button class="btn btn-primary" id="calibre-wb-save">${icon('check', 16)} Save</button>
         </div>
         ` : ''}
 
         ${currentUser?.is_owner ? `
-        <div class="settings-section" id="server-update-section">
+        <div class="settings-section" id="author-photos-section" data-cat="general">
+          <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('users', 20)} Author Photos</h3>
+          <p class="description">Download author portraits from Open Library and cache them on this server. Disabling stops all lookups and clears the cache.</p>
+          <label style="display:flex;align-items:center;gap:var(--space-2);cursor:pointer">
+            <input type="checkbox" id="author-photos-toggle" ${serverSettings.author_images_enabled ? 'checked' : ''}>
+            <span>Enable author photos</span>
+          </label>
+        </div>
+        ` : ''}
+
+        ${currentUser?.is_owner ? `
+        <div class="settings-section" id="server-update-section" data-cat="general">
           <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('download', 20)} Server Update</h3>
           <p class="description">Check for new Ironshelf server releases and apply updates directly from the UI.</p>
           <div class="update-card" id="update-card">
@@ -2444,7 +2675,29 @@
         </div>
         ` : ''}
 
-        <div class="settings-section">
+        ${currentUser?.is_owner ? `
+        <div class="settings-section" id="cloud-settings-section" data-cat="network">
+          <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('globe', 20)} Ironshelf Cloud &amp; Remote Access</h3>
+          <p class="description">Connect this server to Ironshelf Cloud for remote access. Enabling it starts a Cloudflare Tunnel automatically and lets users sign in with their cloud account from anywhere.</p>
+          <div class="cloud-claim-card" id="cloud-claim-card">
+            <div class="cloud-claim-loading">
+              <div class="skeleton skeleton-text" style="width:100%;height:48px"></div>
+            </div>
+          </div>
+
+          <details class="remote-access-advanced" style="margin-top:var(--space-4)">
+            <summary style="cursor:pointer;color:var(--color-muted)">Advanced — remote access method</summary>
+            <p class="description" style="margin-top:var(--space-3)">Choose how this server is reachable from outside your network. Cloudflare Tunnel (used by Cloud) is recommended; UPnP or manual port-forwarding are alternatives.</p>
+            <div class="card remote-access-card" id="remote-access-card">
+              <div class="remote-access-loading">
+                <div class="skeleton skeleton-text" style="width:100%;height:48px"></div>
+              </div>
+            </div>
+          </details>
+        </div>
+        ` : ''}
+
+        <div class="settings-section" data-cat="devices">
           <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('key', 20)} API Keys</h3>
           <p class="description">API keys authenticate the Flutter app or external tools. The key is shown once upon creation.</p>
 
@@ -2474,7 +2727,7 @@
           <button class="btn btn-primary mt-4" id="create-api-key-btn">${icon('plus', 16)} Create API Key</button>
         </div>
 
-        <div class="settings-section">
+        <div class="settings-section" data-cat="devices">
           <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('link', 20)} Device Integration</h3>
           <p class="description">Connect e-readers and third-party apps to your Ironshelf server.</p>
 
@@ -2533,7 +2786,7 @@
           })()}
         </div>
 
-        <div class="settings-section">
+        <div class="settings-section" data-cat="account">
           <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('lock', 20)} Change Password</h3>
           <p class="description">Update your account password. You must provide your current password for verification.</p>
           <form id="change-password-form" class="card" style="max-width:400px;display:flex;flex-direction:column;gap:var(--space-4)" novalidate>
@@ -2556,7 +2809,7 @@
         </div>
 
         ${currentUser?.is_owner ? `
-        <div class="settings-section">
+        <div class="settings-section" data-cat="users">
           <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('mail', 20)} Pending Invites</h3>
           <p class="description">Invite new users by creating invite codes. Share the code with someone to let them create an account.</p>
           <div class="list-group" id="invites-list">
@@ -2566,7 +2819,7 @@
         </div>
         ` : ''}
 
-        <div class="settings-section">
+        <div class="settings-section" data-cat="data">
           <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('download', 20)} Export / Import</h3>
           <p class="description">Export your reading progress, collections, and preferences as JSON. Import a previously exported file to restore data.</p>
           <div class="card" style="display:flex;flex-wrap:wrap;gap:var(--space-4);align-items:center">
@@ -2587,7 +2840,7 @@
           </div>
         </div>
 
-        <div class="settings-section">
+        <div class="settings-section" data-cat="notifications">
           <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('bell', 20)} Notification Preferences</h3>
           <p class="description">Control which notification types appear in your notification panel. Preferences are stored locally in this browser.</p>
 
@@ -2620,7 +2873,7 @@
         ${renderReaderPreferencesSection()}
 
         ${hasPermission('manage_library') ? `
-          <div class="settings-section">
+          <div class="settings-section" data-cat="library">
             <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('globe', 20)} Integrations</h3>
             <p class="description">Manage webhooks, duplicate detection, and other advanced features.</p>
             <div style="display:flex;flex-wrap:wrap;gap:var(--space-3)">
@@ -2630,7 +2883,16 @@
           </div>
         ` : ''}
 
-        <div class="settings-section">
+        <div class="settings-section" data-cat="account">
+          <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('globe', 20)} Ironshelf Cloud Account</h3>
+          <p class="description">Link your Ironshelf Cloud account to this user so you can sign into this server with your cloud login. They become one account.</p>
+          ${currentUser?.cloud_linked
+            ? `<p style="display:flex;align-items:center;gap:var(--space-2);color:var(--color-teal-bright)">${icon('check', 16)} Linked to Ironshelf Cloud.</p>
+               <button class="btn btn-danger" id="unlink-cloud-btn">${icon('x', 16)} Unlink Cloud Account</button>`
+            : `<button class="btn btn-secondary" id="link-cloud-btn">${icon('globe', 16)} Link Ironshelf Cloud Account</button>`}
+        </div>
+
+        <div class="settings-section" data-cat="account">
           <h3>Account</h3>
           <div class="card">
             <dl class="book-detail-metadata" style="margin:0;padding:0;background:transparent;border:0">
@@ -2641,18 +2903,172 @@
             </dl>
           </div>
         </div>
+
+        </div><!-- settings-content -->
+        </div><!-- settings-layout -->
+
+        <div class="settings-version-footer" id="settings-version-footer">
+          <span class="settings-version-text">${cachedServerVersion ? `Ironshelf v${cachedServerVersion}` : 'Ironshelf'}</span>
+        </div>
       `;
 
       renderShell(bodyContent, 'settings');
+      setupSettingsNav(activeCategory);
 
-      // Bind disconnect server button (hosted mode)
-      document.getElementById('disconnect-server-btn')?.addEventListener('click', () => {
-        if (confirm('Disconnect from this server? You will need to reconnect.')) {
-          localStorage.removeItem('ironshelf_server_url');
-          localStorage.removeItem('ironshelf_server_token');
-          window.location.reload();
+      // If version was not yet fetched, populate it now
+      if (!cachedServerVersion) {
+        fetchServerVersion().then(() => {
+          const versionFooter = document.getElementById('settings-version-footer');
+          if (versionFooter && cachedServerVersion) {
+            versionFooter.querySelector('.settings-version-text').textContent = `Ironshelf v${cachedServerVersion}`;
+          }
+        });
+      }
+
+      // Author photos toggle
+      document.getElementById('author-photos-toggle')?.addEventListener('change', async (toggleEvent) => {
+        const enabled = toggleEvent.target.checked;
+        toggleEvent.target.disabled = true;
+        try {
+          const updated = await apiPut('/server/settings', { author_images_enabled: enabled });
+          cachedServerSettings = updated;
+          toast(enabled ? 'Author photos enabled' : 'Author photos disabled (cache cleared)', 'success');
+        } catch (toggleError) {
+          toggleEvent.target.checked = !enabled;
+          toast(toggleError.message || 'Failed to update setting', 'error');
+        } finally {
+          toggleEvent.target.disabled = false;
         }
       });
+
+      // Link Ironshelf Cloud account to this local user
+      document.getElementById('link-cloud-btn')?.addEventListener('click', () => {
+        const { close } = showModal({
+          title: 'Link Ironshelf Cloud Account',
+          description: 'Sign in with your Ironshelf Cloud account. It will become a sign-in for this server, mapped to your current user.',
+          content: `
+            <form id="link-cloud-form" novalidate>
+              <div class="form-group">
+                <label class="form-label" for="link-cloud-email">Cloud Email or Username</label>
+                <input type="text" class="form-input" id="link-cloud-email" required autocomplete="username" autofocus>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="link-cloud-password">Cloud Password</label>
+                <input type="password" class="form-input" id="link-cloud-password" required autocomplete="current-password">
+              </div>
+              <div id="link-cloud-error" class="form-error hidden" role="alert"></div>
+              <div class="modal-actions">
+                <button type="button" class="btn btn-ghost" data-action="cancel">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="link-cloud-submit">${icon('globe', 16)} Link Account</button>
+              </div>
+            </form>
+          `,
+        });
+        const form = document.getElementById('link-cloud-form');
+        form.querySelector('[data-action="cancel"]').addEventListener('click', close);
+        form.addEventListener('submit', async (submitEvent) => {
+          submitEvent.preventDefault();
+          const errorEl = document.getElementById('link-cloud-error');
+          const submitBtn = document.getElementById('link-cloud-submit');
+          errorEl.classList.add('hidden');
+          submitBtn.disabled = true;
+          try {
+            // 1. Authenticate with cloud.
+            const authResponse = await fetch(`${CLOUD_API}/auth/login`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                email_or_username: document.getElementById('link-cloud-email').value,
+                password: document.getElementById('link-cloud-password').value,
+              }),
+            });
+            const authData = await authResponse.json().catch(() => ({}));
+            if (!authResponse.ok || !authData.data?.token) {
+              throw new Error(authData.error || 'Cloud sign-in failed');
+            }
+            const cloudJwt = authData.data.token;
+
+            // 2. This server must be claimed (need its cloud server_id).
+            const claimStatus = await apiGet('/auth/claim-status').catch(() => null);
+            const serverId = claimStatus?.server_id;
+            if (!claimStatus?.is_claimed || !serverId) {
+              throw new Error('Claim this server to Ironshelf Cloud first (Settings → Ironshelf Cloud).');
+            }
+
+            // 3. Get a server-scoped access token (signed with the claim token).
+            const tokenResponse = await fetch(`${CLOUD_API}/servers/${serverId}/token`, {
+              method: 'POST',
+              headers: { 'Authorization': `Bearer ${cloudJwt}` },
+            });
+            const tokenData = await tokenResponse.json().catch(() => ({}));
+            if (!tokenResponse.ok || !tokenData.data?.server_access_token) {
+              throw new Error(tokenData.error || 'Could not get a server access token (is your cloud account linked to this server?)');
+            }
+
+            // 4. Link on this server.
+            const linkResult = await apiPost('/auth/link-cloud', { cloud_token: tokenData.data.server_access_token });
+            close();
+            toast(`Linked cloud account "${linkResult.cloud_username || ''}" to your user`, 'success');
+            if (currentUser) currentUser.cloud_linked = true;
+            renderSettings(parseRoute(getHashPath()).params.id);
+          } catch (linkError) {
+            errorEl.textContent = linkError.message || 'Failed to link cloud account';
+            errorEl.classList.remove('hidden');
+            submitBtn.disabled = false;
+          }
+        });
+      });
+
+      // Unlink cloud account
+      document.getElementById('unlink-cloud-btn')?.addEventListener('click', () => {
+        showConfirmModal({
+          title: 'Unlink Cloud Account',
+          message: 'Signing in with your cloud account will no longer log into this user.',
+          confirmText: 'Unlink',
+          onConfirm: async () => {
+            try {
+              await apiPost('/auth/unlink-cloud', {});
+              if (currentUser) currentUser.cloud_linked = false;
+              toast('Cloud account unlinked', 'success');
+              renderSettings(parseRoute(getHashPath()).params.id);
+            } catch (unlinkError) {
+              toast(unlinkError.message || 'Failed to unlink', 'error');
+            }
+          },
+        });
+      });
+
+      // Calibre write-back settings
+      const calibreWbMode = document.getElementById('calibre-wb-mode');
+      if (calibreWbMode) {
+        const calibredbFields = document.getElementById('calibre-wb-calibredb-fields');
+        const csFields = document.getElementById('calibre-wb-cs-fields');
+        calibreWbMode.addEventListener('change', () => {
+          calibredbFields?.classList.toggle('hidden', calibreWbMode.value !== 'calibredb');
+          csFields?.classList.toggle('hidden', calibreWbMode.value !== 'content_server');
+        });
+        document.getElementById('calibre-wb-save')?.addEventListener('click', async () => {
+          const saveBtn = document.getElementById('calibre-wb-save');
+          saveBtn.disabled = true;
+          const payload = {
+            calibre_writeback_mode: calibreWbMode.value,
+            calibredb_path: document.getElementById('calibre-wb-path')?.value || '',
+            calibre_cs_url: document.getElementById('calibre-wb-url')?.value || '',
+            calibre_cs_library_id: document.getElementById('calibre-wb-library')?.value || '',
+            calibre_cs_username: document.getElementById('calibre-wb-username')?.value || '',
+          };
+          const newPassword = document.getElementById('calibre-wb-password')?.value;
+          if (newPassword) payload.calibre_cs_password = newPassword;
+          try {
+            cachedServerSettings = await apiPut('/server/settings', payload);
+            toast('Calibre write-back settings saved', 'success');
+          } catch (saveError) {
+            toast(saveError.message || 'Failed to save settings', 'error');
+          } finally {
+            saveBtn.disabled = false;
+          }
+        });
+      }
 
       // Bind events
       document.getElementById('create-api-key-btn')?.addEventListener('click', () => {
@@ -2721,7 +3137,7 @@
             const modal = document.querySelector('.modal-overlay:last-child');
             modal.querySelector('[data-action="done"]')?.addEventListener('click', () => {
               modal.remove();
-              renderSettings();
+              renderSettings(parseRoute(getHashPath()).params.id);
             });
             modal.querySelector('#copy-key-btn')?.addEventListener('click', () => {
               navigator.clipboard.writeText(result.key).then(() => {
@@ -2748,7 +3164,7 @@
               try {
                 await apiDelete(`/auth/api-keys/${keyId}`);
                 toast('API key deleted', 'success');
-                renderSettings();
+                renderSettings(parseRoute(getHashPath()).params.id);
               } catch (err) {
                 toast(err.message, 'error');
               }
@@ -2787,7 +3203,7 @@
           const importData = JSON.parse(text);
           const result = await apiPost('/import', importData);
           toast(result?.message || 'Data imported successfully', 'success');
-          renderSettings();
+          renderSettings(parseRoute(getHashPath()).params.id);
         } catch (err) {
           toast(err.message || 'Import failed — check file format', 'error');
         }
@@ -2828,6 +3244,16 @@
 
       // Server update check (owner only)
       bindServerUpdateEvents();
+
+      // Remote access (owner only)
+      if (currentUser?.is_owner) {
+        loadRemoteAccessCard();
+      }
+
+      // Cloud settings (owner only)
+      if (currentUser?.is_owner) {
+        loadCloudSettingsCard();
+      }
 
       // Device integration copy buttons
       document.querySelectorAll('.copy-device-url').forEach(btn => {
@@ -2909,6 +3335,610 @@
       }
     } catch (err) {
       renderShell(renderError('Failed to load settings', err.message, () => renderSettings()), 'settings');
+    }
+  }
+
+  // ---- Remote Access Card ----
+
+  let remoteAccessPollingInterval = null;
+
+  async function loadRemoteAccessCard(methodOverride = null) {
+    const cardContainer = document.getElementById('remote-access-card');
+    if (!cardContainer) return;
+
+    // Stop any previous polling interval.
+    if (remoteAccessPollingInterval) {
+      clearInterval(remoteAccessPollingInterval);
+      remoteAccessPollingInterval = null;
+    }
+
+    try {
+      const status = await apiGet('/server/remote-access');
+
+      // Method selector (always shown at top). An explicit override (from the
+      // dropdown) wins so selecting a method shows its panel even before it is
+      // started — the server only reports a non-none method once one is active.
+      const currentMethod = methodOverride || status.method || 'none';
+      const methodSelectorHtml = `
+        <div class="remote-access-method-selector" style="margin-bottom:var(--space-4)">
+          <label class="form-label" for="remote-access-method-select">Method</label>
+          <select class="form-input" id="remote-access-method-select" style="width:auto;min-width:280px">
+            <option value="none" ${currentMethod === 'none' ? 'selected' : ''}>None (local network only)</option>
+            <option value="upnp" ${currentMethod === 'upnp' ? 'selected' : ''}>UPnP (auto port forward)</option>
+            <option value="tunnel" ${currentMethod === 'tunnel' ? 'selected' : ''}>Cloudflare Tunnel (recommended)</option>
+            <option value="manual" ${currentMethod === 'manual' ? 'selected' : ''}>Manual (you handle forwarding)</option>
+          </select>
+        </div>
+      `;
+
+      // Build method-specific panel.
+      let methodPanelHtml = '';
+
+      if (currentMethod === 'tunnel' || status.tunnel?.active) {
+        methodPanelHtml = buildTunnelPanel(status);
+      } else if (currentMethod === 'upnp' || (status.upnp?.enabled)) {
+        methodPanelHtml = buildUpnpPanel(status);
+      } else if (currentMethod === 'manual') {
+        methodPanelHtml = `
+          <div class="remote-access-status">
+            <div class="remote-access-status-header">
+              <span class="remote-access-indicator remote-access-connecting"></span>
+              <strong>Manual Mode</strong>
+            </div>
+            <p class="form-hint" style="margin-top:var(--space-2)">
+              You are managing port forwarding or reverse proxy externally.
+              Configure your router or reverse proxy to forward traffic to this server's port.
+            </p>
+          </div>
+        `;
+      } else {
+        methodPanelHtml = `
+          <div class="remote-access-status">
+            <div class="remote-access-status-header">
+              <span class="remote-access-indicator remote-access-disconnected"></span>
+              <strong>Disabled</strong>
+            </div>
+            <p class="form-hint" style="margin-top:var(--space-2)">Select a method above to enable remote access.</p>
+          </div>
+        `;
+      }
+
+      cardContainer.innerHTML = methodSelectorHtml + methodPanelHtml;
+
+      // Bind event handlers.
+      bindRemoteAccessEvents(status);
+
+      // Start polling every 10 seconds while the card is visible.
+      remoteAccessPollingInterval = setInterval(async () => {
+        if (!document.getElementById('remote-access-card')) {
+          clearInterval(remoteAccessPollingInterval);
+          remoteAccessPollingInterval = null;
+          return;
+        }
+        try {
+          const refreshedStatus = await apiGet('/server/remote-access');
+          const currentIndicator = document.querySelector('.remote-access-indicator');
+          const wasActive = currentIndicator?.classList.contains('remote-access-connected');
+          const wasConnecting = currentIndicator?.classList.contains('remote-access-connecting');
+          const isNowActive = refreshedStatus.active;
+          const isNowConnecting = refreshedStatus.enabled && !refreshedStatus.active;
+          if ((isNowActive && !wasActive) || (isNowConnecting && !wasConnecting) || (!refreshedStatus.enabled && (wasActive || wasConnecting))) {
+            loadRemoteAccessCard();
+          }
+        } catch (_) {
+          // Silently ignore polling errors.
+        }
+      }, 10000);
+
+    } catch (loadError) {
+      cardContainer.innerHTML = `
+        <div class="remote-access-status">
+          <p class="remote-access-error">Failed to load remote access status: ${escapeHtml(loadError.message)}</p>
+          <button class="btn btn-secondary btn-sm" style="margin-top:var(--space-3)" onclick="loadRemoteAccessCard()">Retry</button>
+        </div>
+      `;
+    }
+  }
+
+  function buildTunnelPanel(status) {
+    const tunnel = status.tunnel || {};
+
+    if (tunnel.active && tunnel.public_url) {
+      return `
+        <div class="remote-access-status">
+          <div class="remote-access-status-header">
+            <span class="remote-access-indicator remote-access-connected"></span>
+            <strong>Connected via Cloudflare Tunnel</strong>
+          </div>
+          <dl class="remote-access-details">
+            <dt>Public URL</dt>
+            <dd>
+              <div class="device-url-row" style="margin:0">
+                <code class="device-url" id="remote-access-public-url">${escapeHtml(tunnel.public_url)}</code>
+                <button class="btn btn-ghost btn-sm copy-remote-url" aria-label="Copy public URL">${icon('copy', 14)}</button>
+              </div>
+            </dd>
+          </dl>
+          <div class="remote-access-actions" style="margin-top:var(--space-4);display:flex;flex-wrap:wrap;gap:var(--space-3);align-items:center">
+            <button class="btn btn-danger btn-sm" id="tunnel-stop-btn">${icon('x', 14)} Stop Tunnel</button>
+          </div>
+        </div>
+      `;
+    }
+
+    if (!tunnel.available) {
+      return `
+        <div class="remote-access-status">
+          <div class="remote-access-status-header">
+            <span class="remote-access-indicator remote-access-disconnected"></span>
+            <strong>cloudflared not installed</strong>
+          </div>
+          <p class="form-hint" style="margin-top:var(--space-2)">
+            Cloudflare Tunnel requires <code>cloudflared</code>. Click Start Tunnel below — it will be installed automatically.
+          </p>
+          <button class="btn btn-primary mt-4" id="tunnel-start-btn">${icon('download', 16)} Install &amp; Start Tunnel</button>
+          ${tunnel.error ? `<p class="remote-access-error" style="margin-top:var(--space-2)">${escapeHtml(tunnel.error)}</p>` : ''}
+        </div>
+      `;
+    }
+
+    // Available but not active.
+    return `
+      <div class="remote-access-status">
+        <div class="remote-access-status-header">
+          <span class="remote-access-indicator remote-access-disconnected"></span>
+          <strong>Tunnel not running</strong>
+        </div>
+        ${tunnel.error ? `<p class="remote-access-error" style="margin-top:var(--space-2)">${escapeHtml(tunnel.error)}</p>` : ''}
+        <p class="form-hint" style="margin-top:var(--space-2)">
+          Start a Cloudflare Quick Tunnel to get a public URL instantly. No account or configuration required.
+        </p>
+        <div class="remote-access-actions" style="margin-top:var(--space-4)">
+          <button class="btn btn-primary btn-sm" id="tunnel-start-btn">${icon('globe', 14)} Start Tunnel</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function buildUpnpPanel(status) {
+    const upnp = status.upnp || {};
+
+    if (upnp.enabled && upnp.active) {
+      return `
+        <div class="remote-access-status">
+          <div class="remote-access-status-header">
+            <span class="remote-access-indicator remote-access-connected"></span>
+            <strong>Connected via UPnP</strong>
+          </div>
+          <dl class="remote-access-details">
+            <dt>Public URL</dt>
+            <dd>
+              <div class="device-url-row" style="margin:0">
+                <code class="device-url" id="remote-access-public-url">${escapeHtml(upnp.public_url)}</code>
+                <button class="btn btn-ghost btn-sm copy-remote-url" aria-label="Copy public URL">${icon('copy', 14)}</button>
+              </div>
+            </dd>
+            <dt>Public IP</dt>
+            <dd><code>${escapeHtml(upnp.public_ip || 'unknown')}</code></dd>
+            <dt>External Port</dt>
+            <dd>${upnp.external_port}</dd>
+            <dt>Internal Port</dt>
+            <dd>${upnp.internal_port}</dd>
+          </dl>
+          <div class="remote-access-actions" style="margin-top:var(--space-4);display:flex;flex-wrap:wrap;gap:var(--space-3);align-items:center">
+            <button class="btn btn-secondary btn-sm" id="remote-access-test-btn">${icon('check', 14)} Test Reachability</button>
+            <button class="btn btn-danger btn-sm" id="remote-access-disable-btn">${icon('x', 14)} Disable</button>
+          </div>
+          <div class="remote-access-port-change" style="margin-top:var(--space-4)">
+            <label class="form-label" for="remote-access-port-input">External Port</label>
+            <div style="display:flex;gap:var(--space-2);align-items:center">
+              <input type="number" class="form-input" id="remote-access-port-input" value="${upnp.external_port}" min="1" max="65535" style="width:120px">
+              <button class="btn btn-secondary btn-sm" id="remote-access-apply-port-btn">Apply</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    if (upnp.enabled && !upnp.active) {
+      return `
+        <div class="remote-access-status">
+          <div class="remote-access-status-header">
+            <span class="remote-access-indicator remote-access-connecting"></span>
+            <strong>UPnP not reachable</strong>
+          </div>
+          ${upnp.error ? `<p class="remote-access-error">${escapeHtml(upnp.error)}</p>` : ''}
+          <p class="form-hint" style="margin-top:var(--space-2)">You can manually forward port ${upnp.external_port} on your router if UPnP is not supported, or try Cloudflare Tunnel instead.</p>
+          <div class="remote-access-actions" style="margin-top:var(--space-4);display:flex;flex-wrap:wrap;gap:var(--space-3)">
+            <button class="btn btn-primary btn-sm" id="remote-access-retry-btn">${icon('refresh', 14)} Retry</button>
+            <button class="btn btn-danger btn-sm" id="remote-access-disable-btn">${icon('x', 14)} Disable</button>
+          </div>
+        </div>
+      `;
+    }
+
+    // UPnP not enabled yet.
+    return `
+      <div class="remote-access-status">
+        <div class="remote-access-status-header">
+          <span class="remote-access-indicator remote-access-disconnected"></span>
+          <strong>UPnP disabled</strong>
+        </div>
+        <p class="form-hint" style="margin-top:var(--space-2)">Enable UPnP port forwarding to make this server reachable from outside your local network.</p>
+        <div class="remote-access-actions" style="margin-top:var(--space-4);display:flex;flex-wrap:wrap;gap:var(--space-3);align-items:center">
+          <button class="btn btn-primary btn-sm" id="remote-access-enable-btn">${icon('globe', 14)} Enable UPnP</button>
+          <div style="display:flex;gap:var(--space-2);align-items:center">
+            <label class="form-label" for="remote-access-port-input-disabled" style="margin:0;white-space:nowrap">External Port:</label>
+            <input type="number" class="form-input" id="remote-access-port-input-disabled" value="${upnp.external_port}" min="1" max="65535" style="width:120px">
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function bindRemoteAccessEvents(status) {
+    const upnp = status.upnp || {};
+
+    // Method selector change.
+    document.getElementById('remote-access-method-select')?.addEventListener('change', async (changeEvent) => {
+      const selectedMethod = changeEvent.target.value;
+
+      // If switching away from an active method, stop the current one first.
+      if (status.tunnel?.active && selectedMethod !== 'tunnel') {
+        try { await apiPost('/server/remote-access/tunnel/stop', {}); } catch (_) {}
+      }
+      if (upnp.enabled && selectedMethod !== 'upnp') {
+        try { await apiPost('/server/remote-access/disable', {}); } catch (_) {}
+      }
+
+      // Show the selected method's panel (with its Start/enable controls).
+      loadRemoteAccessCard(selectedMethod);
+    });
+
+    // --- Tunnel events ---
+    document.getElementById('tunnel-start-btn')?.addEventListener('click', async () => {
+      const startButton = document.getElementById('tunnel-start-btn');
+      startButton.disabled = true;
+      startButton.textContent = 'Starting tunnel...';
+      try {
+        const tunnelResult = await apiPost('/server/remote-access/tunnel/start', {});
+        if (tunnelResult.active) {
+          toast('Cloudflare tunnel started', 'success');
+        } else {
+          toast(tunnelResult.error || 'Failed to start tunnel', 'error');
+        }
+        loadRemoteAccessCard();
+      } catch (startError) {
+        toast(startError.message || 'Failed to start tunnel', 'error');
+        loadRemoteAccessCard();
+      }
+    });
+
+    document.getElementById('tunnel-stop-btn')?.addEventListener('click', async () => {
+      try {
+        await apiPost('/server/remote-access/tunnel/stop', {});
+        toast('Cloudflare tunnel stopped', 'success');
+        loadRemoteAccessCard();
+      } catch (stopError) {
+        toast(stopError.message || 'Failed to stop tunnel', 'error');
+      }
+    });
+
+    // --- UPnP events ---
+    document.getElementById('remote-access-enable-btn')?.addEventListener('click', async () => {
+      const portInput = document.getElementById('remote-access-port-input-disabled');
+      const externalPort = portInput ? parseInt(portInput.value, 10) : upnp.external_port;
+      const enableButton = document.getElementById('remote-access-enable-btn');
+      enableButton.disabled = true;
+      enableButton.textContent = 'Enabling...';
+      try {
+        await apiPost('/server/remote-access/enable', { external_port: externalPort });
+        toast('UPnP remote access enabled', 'success');
+        loadRemoteAccessCard();
+      } catch (enableError) {
+        toast(enableError.message || 'Failed to enable UPnP', 'error');
+        loadRemoteAccessCard();
+      }
+    });
+
+    document.getElementById('remote-access-disable-btn')?.addEventListener('click', async () => {
+      try {
+        await apiPost('/server/remote-access/disable', {});
+        toast('UPnP remote access disabled', 'success');
+        loadRemoteAccessCard();
+      } catch (disableError) {
+        toast(disableError.message || 'Failed to disable UPnP', 'error');
+      }
+    });
+
+    document.getElementById('remote-access-retry-btn')?.addEventListener('click', async () => {
+      const retryButton = document.getElementById('remote-access-retry-btn');
+      retryButton.disabled = true;
+      retryButton.textContent = 'Retrying...';
+      try {
+        await apiPost('/server/remote-access/enable', { external_port: upnp.external_port });
+        toast('UPnP re-established', 'success');
+        loadRemoteAccessCard();
+      } catch (retryError) {
+        toast(retryError.message || 'Retry failed', 'error');
+        loadRemoteAccessCard();
+      }
+    });
+
+    document.getElementById('remote-access-test-btn')?.addEventListener('click', async () => {
+      const testButton = document.getElementById('remote-access-test-btn');
+      testButton.disabled = true;
+      testButton.textContent = 'Testing...';
+      try {
+        const testResult = await apiPost('/server/remote-access/test', {});
+        if (testResult.reachable) {
+          toast('Port mapping is registered on your router', 'success');
+        } else {
+          toast('Port mapping not found on router. It may have expired or been removed.', 'warning');
+        }
+      } catch (testError) {
+        toast(testError.message || 'Reachability test failed', 'error');
+      }
+      testButton.disabled = false;
+      testButton.innerHTML = `${icon('check', 14)} Test Reachability`;
+    });
+
+    document.getElementById('remote-access-apply-port-btn')?.addEventListener('click', async () => {
+      const portInput = document.getElementById('remote-access-port-input');
+      const newPort = parseInt(portInput.value, 10);
+      if (isNaN(newPort) || newPort < 1 || newPort > 65535) {
+        toast('Invalid port number (1-65535)', 'warning');
+        return;
+      }
+      const applyButton = document.getElementById('remote-access-apply-port-btn');
+      applyButton.disabled = true;
+      applyButton.textContent = 'Applying...';
+      try {
+        await apiPost('/server/remote-access/disable', {});
+        await apiPost('/server/remote-access/enable', { external_port: newPort });
+        toast(`Port changed to ${newPort}`, 'success');
+        loadRemoteAccessCard();
+      } catch (portChangeError) {
+        toast(portChangeError.message || 'Failed to change port', 'error');
+        loadRemoteAccessCard();
+      }
+    });
+
+    // Copy public URL button (works for both UPnP and tunnel).
+    document.querySelector('.copy-remote-url')?.addEventListener('click', () => {
+      const urlElement = document.getElementById('remote-access-public-url');
+      if (!urlElement) return;
+      navigator.clipboard.writeText(urlElement.textContent.trim()).then(() => {
+        toast('Public URL copied to clipboard', 'success');
+      }).catch(() => {
+        toast('Failed to copy -- select and copy manually', 'warning');
+      });
+    });
+  }
+
+  async function loadCloudSettingsCard() {
+    const cardContainer = document.getElementById('cloud-claim-card');
+    if (!cardContainer) return;
+
+    try {
+      const claimStatus = await fetch(`${API}/auth/claim-status`).then(r => r.ok ? r.json() : null).catch(() => null);
+
+      if (claimStatus?.is_claimed) {
+        // Server is claimed — show status and unclaim button
+        const cloudUrl = claimStatus.cloud_service_url || CLOUD_API;
+        const serverId = claimStatus.server_id || 'unknown';
+
+        cardContainer.innerHTML = `
+          <div class="card cloud-status-card cloud-status-claimed">
+            <div class="cloud-status-header">
+              <span class="cloud-status-indicator cloud-status-connected"></span>
+              <strong>Linked to Ironshelf Cloud</strong>
+            </div>
+            <dl class="cloud-status-details">
+              <dt>Server ID</dt>
+              <dd><code>${escapeHtml(serverId)}</code></dd>
+              <dt>Cloud Service</dt>
+              <dd>${escapeHtml(cloudUrl)}</dd>
+            </dl>
+            <p class="text-caption" style="margin-top:var(--space-3)">Users with Ironshelf Cloud accounts can sign in to this server.</p>
+            <button class="btn btn-danger mt-4" id="unclaim-server-btn">${icon('x', 16)} Disconnect from Cloud</button>
+          </div>
+        `;
+
+        document.getElementById('unclaim-server-btn')?.addEventListener('click', () => {
+          showConfirmModal({
+            title: 'Disconnect from Ironshelf Cloud',
+            message: 'This will remove the cloud link. Users who signed in via Ironshelf Cloud will lose access on their next session. You can reclaim the server later.',
+            confirmText: 'Disconnect',
+            onConfirm: async () => {
+              try {
+                await apiDelete('/auth/unclaim');
+                toast('Server disconnected from Ironshelf Cloud', 'success');
+                loadCloudSettingsCard();
+              } catch (unclaimError) {
+                toast(unclaimError.message, 'error');
+              }
+            },
+          });
+        });
+      } else {
+        // Server is NOT claimed — show claim button
+        cardContainer.innerHTML = `
+          <div class="card cloud-status-card">
+            <div class="cloud-status-header">
+              <span class="cloud-status-indicator cloud-status-disconnected"></span>
+              <strong>Not connected</strong>
+            </div>
+            <p class="text-caption" style="margin-top:var(--space-2)">Enable Ironshelf Cloud to reach this server from anywhere — it starts a Cloudflare Tunnel automatically and lets users sign in with their cloud account. This is <strong>completely optional</strong> — your server works fully without it.</p>
+            <p class="text-caption" style="margin-top:var(--space-1);font-size:var(--text-xs);color:var(--color-muted)">Cloud only stores your server URL and who has access. No book data, reading history, or files ever leave your server.</p>
+            <button class="btn btn-cloud mt-4" id="claim-server-btn" style="width:auto">${icon('globe', 16)} Enable Ironshelf Cloud</button>
+          </div>
+        `;
+
+        document.getElementById('claim-server-btn')?.addEventListener('click', () => {
+          const { close } = showModal({
+            title: 'Claim Server via Ironshelf Cloud',
+            description: 'Sign in with your Ironshelf Cloud account to claim this server.',
+            content: `
+              <form id="cloud-claim-form" novalidate>
+                <div class="form-group hidden" id="claim-register-fields">
+                  <label class="form-label" for="claim-reg-email">Cloud Email</label>
+                  <input type="email" class="form-input" id="claim-reg-email" autocomplete="email">
+                  <label class="form-label" for="claim-reg-username" style="margin-top:var(--space-3)">Username</label>
+                  <input type="text" class="form-input" id="claim-reg-username" autocomplete="username" placeholder="2-32 chars, letters/numbers/underscore">
+                </div>
+                <div class="form-group" id="claim-login-identifier-group">
+                  <label class="form-label" for="claim-cloud-email">Cloud Email or Username</label>
+                  <input type="text" class="form-input" id="claim-cloud-email" required autocomplete="email" autofocus>
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="claim-cloud-password">Cloud Password</label>
+                  <input type="password" class="form-input" id="claim-cloud-password" required autocomplete="current-password">
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="claim-server-name">Server Name</label>
+                  <input type="text" class="form-input" id="claim-server-name" placeholder="My Ironshelf Server" value="${escapeHtml(window.location.hostname)}">
+                  <p class="form-hint">A friendly name for this server in your cloud dashboard.</p>
+                </div>
+                <div id="claim-error" class="form-error hidden" role="alert"></div>
+                <div class="modal-actions">
+                  <button type="button" class="btn btn-ghost" data-action="cancel">Cancel</button>
+                  <button type="submit" class="btn btn-primary" id="claim-submit-btn">${icon('globe', 16)} Claim Server</button>
+                </div>
+                <div class="login-footer" style="margin-top:var(--space-3);text-align:center">
+                  <span id="claim-mode-hint">No Ironshelf Cloud account?</span>
+                  <a href="#" id="claim-mode-toggle">Create one</a>
+                </div>
+              </form>
+            `,
+          });
+
+          const claimForm = document.getElementById('cloud-claim-form');
+          claimForm.querySelector('[data-action="cancel"]').addEventListener('click', close);
+
+          // Toggle between sign-in and register modes.
+          let isRegisterMode = false;
+          const registerFields = document.getElementById('claim-register-fields');
+          const loginIdentifierGroup = document.getElementById('claim-login-identifier-group');
+          const claimSubmitBtnEl = document.getElementById('claim-submit-btn');
+          const modeHint = document.getElementById('claim-mode-hint');
+          const modeToggle = document.getElementById('claim-mode-toggle');
+          modeToggle.addEventListener('click', (toggleEvent) => {
+            toggleEvent.preventDefault();
+            isRegisterMode = !isRegisterMode;
+            registerFields.classList.toggle('hidden', !isRegisterMode);
+            loginIdentifierGroup.classList.toggle('hidden', isRegisterMode);
+            document.getElementById('claim-cloud-email').required = !isRegisterMode;
+            claimSubmitBtnEl.innerHTML = isRegisterMode
+              ? `${icon('globe', 16)} Create account &amp; claim`
+              : `${icon('globe', 16)} Claim Server`;
+            modeHint.textContent = isRegisterMode ? 'Already have a cloud account?' : 'No Ironshelf Cloud account?';
+            modeToggle.textContent = isRegisterMode ? 'Sign in' : 'Create one';
+          });
+
+          // Shared: take an authenticated cloud JWT, claim the server, persist locally.
+          async function completeCloudClaim(cloudJwt) {
+            const claimCloudResponse = await fetch(`${CLOUD_API}/servers/claim`, {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${cloudJwt}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                server_url: window.location.origin,
+                server_name: document.getElementById('claim-server-name').value || window.location.hostname,
+              }),
+            });
+            if (!claimCloudResponse.ok) {
+              const claimCloudError = await claimCloudResponse.json().catch(() => ({}));
+              throw new Error(claimCloudError.error || 'Failed to claim server on cloud');
+            }
+            const claimCloudData = await claimCloudResponse.json();
+            const claimToken = claimCloudData.data?.claim_token;
+            const serverId = claimCloudData.data?.server_id;
+            if (!claimToken) {
+              throw new Error('Cloud did not return a claim token');
+            }
+            await apiPost('/auth/claim', {
+              claim_token: claimToken,
+              cloud_service_url: CLOUD_API,
+              server_id: serverId,
+            });
+          }
+
+          claimForm.addEventListener('submit', async (formEvent) => {
+            formEvent.preventDefault();
+            const claimError = document.getElementById('claim-error');
+            const claimSubmitBtn = document.getElementById('claim-submit-btn');
+            claimError.classList.add('hidden');
+            claimSubmitBtn.disabled = true;
+            claimSubmitBtn.textContent = isRegisterMode ? 'Creating account...' : 'Claiming...';
+
+            try {
+              const password = document.getElementById('claim-cloud-password').value;
+              let cloudJwt;
+
+              if (isRegisterMode) {
+                // Create a new Ironshelf Cloud account, which returns a token.
+                const registerResponse = await fetch(`${CLOUD_API}/auth/register`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    email: document.getElementById('claim-reg-email').value,
+                    username: document.getElementById('claim-reg-username').value,
+                    password,
+                  }),
+                });
+                if (!registerResponse.ok) {
+                  const registerError = await registerResponse.json().catch(() => ({}));
+                  throw new Error(registerError.error || 'Failed to create cloud account');
+                }
+                const registerData = await registerResponse.json();
+                cloudJwt = registerData.data?.token;
+                if (!cloudJwt) throw new Error('Invalid response from cloud service');
+              } else {
+                // Authenticate with an existing cloud account.
+                const cloudAuthResponse = await fetch(`${CLOUD_API}/auth/login`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    email_or_username: document.getElementById('claim-cloud-email').value,
+                    password,
+                  }),
+                });
+                if (!cloudAuthResponse.ok) {
+                  const cloudAuthError = await cloudAuthResponse.json().catch(() => ({}));
+                  throw new Error(cloudAuthError.error || 'Cloud authentication failed');
+                }
+                const cloudAuthData = await cloudAuthResponse.json();
+                cloudJwt = cloudAuthData.data?.token;
+                if (!cloudAuthData.ok || !cloudJwt) {
+                  throw new Error('Invalid response from cloud service');
+                }
+              }
+
+              await completeCloudClaim(cloudJwt);
+
+              close();
+              toast('Server claimed successfully! Cloud login is now enabled.', 'success');
+              loadCloudSettingsCard();
+            } catch (claimAttemptError) {
+              claimError.textContent = claimAttemptError.message;
+              claimError.classList.remove('hidden');
+              claimSubmitBtn.disabled = false;
+              claimSubmitBtn.innerHTML = isRegisterMode
+                ? `${icon('globe', 16)} Create account &amp; claim`
+                : `${icon('globe', 16)} Claim Server`;
+            }
+          });
+        });
+      }
+    } catch (loadError) {
+      cardContainer.innerHTML = `
+        <div class="card" style="color:var(--color-muted);text-align:center;padding:var(--space-6)">
+          Failed to load cloud status
+        </div>
+      `;
     }
   }
 
@@ -3113,7 +4143,7 @@
     let updatePollTimer = null;
     let serverDownDetected = false;
     let reconnectAttempts = 0;
-    const maxReconnectAttempts = 60; // 2 minutes at 2-second intervals
+    const maxReconnectAttempts = 15; // 30 seconds at 2-second intervals
 
     updatePollTimer = setInterval(async () => {
       try {
@@ -3123,9 +4153,22 @@
           if (reconnectAttempts > maxReconnectAttempts) {
             clearInterval(updatePollTimer);
             updateCard.innerHTML = `
-              <div style="display:flex;align-items:center;gap:var(--space-3);color:var(--color-warning);font-size:var(--text-sm)">
+              <div class="update-progress">
+                <div class="update-progress-step is-complete">
+                  <span class="update-success-icon">${Icons.check}</span>
+                  <span>Downloaded</span>
+                </div>
+                <div class="update-progress-step is-complete">
+                  <span class="update-success-icon">${Icons.check}</span>
+                  <span>Binary replaced</span>
+                </div>
+              </div>
+              <div style="display:flex;align-items:flex-start;gap:var(--space-3);color:var(--color-warning);font-size:var(--text-sm);margin-top:var(--space-4);padding:var(--space-3) var(--space-4);border-radius:var(--radius);background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.2)">
                 ${icon('alertCircle', 18)}
-                <span>Server has not come back online after 2 minutes. It may need manual restart.</span>
+                <div>
+                  <strong>Server is updating.</strong> Please refresh this page manually once the server restarts.
+                  <br><span style="opacity:0.7;font-size:var(--text-xs)">If the server does not come back, it may need to be restarted manually from the command line.</span>
+                </div>
               </div>
             `;
             return;
@@ -3153,10 +4196,11 @@
                 </div>
                 <div class="update-available-banner" style="margin-top:var(--space-4);background:rgba(34,197,94,0.08);border-color:rgba(34,197,94,0.2);color:var(--color-success)">
                   ${icon('check', 18)}
-                  <span>Successfully updated to v${escapeHtml(healthData.version || targetVersion)}</span>
+                  <span>Successfully updated to v${escapeHtml(targetVersion)}</span>
                 </div>
               `;
               toast('Server updated successfully', 'success');
+              fetchServerVersion(true);
             }
           } catch {
             // Still down — keep polling
@@ -3210,6 +4254,39 @@
               restartStep.innerHTML = `<span class="update-spinner"></span><span>Restarting server...</span>`;
             }
             serverDownDetected = true;
+            break;
+
+          case 'manual_restart_required':
+            clearInterval(updatePollTimer);
+            if (downloadStep) {
+              downloadStep.className = 'update-progress-step is-complete';
+              downloadStep.innerHTML = `<span class="update-success-icon">${Icons.check}</span><span>Downloaded</span>`;
+            }
+            if (downloadBar) downloadBar.style.width = '100%';
+            if (replaceStep) {
+              replaceStep.className = 'update-progress-step is-complete';
+              replaceStep.innerHTML = `<span class="update-success-icon">${Icons.check}</span><span>Binary staged</span>`;
+            }
+            updateCard.innerHTML = `
+              <div class="update-progress">
+                <div class="update-progress-step is-complete">
+                  <span class="update-success-icon">${Icons.check}</span>
+                  <span>Downloaded v${escapeHtml(targetVersion)}</span>
+                </div>
+                <div class="update-progress-step is-complete">
+                  <span class="update-success-icon">${Icons.check}</span>
+                  <span>Binary staged</span>
+                </div>
+              </div>
+              <div style="display:flex;align-items:flex-start;gap:var(--space-3);font-size:var(--text-sm);margin-top:var(--space-4);padding:var(--space-3) var(--space-4);border-radius:var(--radius);background:rgba(59,179,201,0.08);border:1px solid rgba(59,179,201,0.2);color:var(--color-text-secondary)">
+                ${icon('info', 18)}
+                <div>
+                  <strong style="color:var(--color-text)">Update downloaded. Please restart the server to apply.</strong>
+                  <br>Restart the Ironshelf service or re-run the server executable, then refresh this page.
+                </div>
+              </div>
+            `;
+            toast('Update downloaded — restart the server to apply', 'success');
             break;
 
           case 'failed':
@@ -3279,6 +4356,7 @@
                     <td><span class="badge ${u.is_owner ? 'badge-teal' : 'badge-muted'}">${u.is_owner ? 'Owner' : 'User'}</span></td>
                     <td class="text-caption">${u.created_at ? new Date(u.created_at).toLocaleDateString() : '—'}</td>
                     <td class="text-right" style="display:flex;gap:var(--space-1);justify-content:flex-end">
+                      <button class="btn btn-ghost btn-sm reset-pw-btn" data-user-id="${u.id}" data-username="${escapeHtml(u.username)}" aria-label="Reset password for ${escapeHtml(u.username)}" title="Reset password">${icon('lock', 14)}</button>
                       ${!u.is_owner ? `<button class="btn btn-ghost btn-sm library-access-btn" data-user-id="${u.id}" aria-label="Library access for ${escapeHtml(u.username)}" title="Library access">${icon('library', 14)}</button>` : ''}
                       ${!u.is_owner ? `<button class="btn btn-ghost btn-sm delete-user-btn" data-user-id="${u.id}" aria-label="Remove ${escapeHtml(u.username)}">${icon('trash', 14)}</button>` : ''}
                     </td>
@@ -3372,6 +4450,53 @@
     document.querySelectorAll('.library-access-btn').forEach(btn => {
       btn.addEventListener('click', () => {
         showLibraryAccessModal(btn.dataset.userId);
+      });
+    });
+
+    // Reset password buttons
+    document.querySelectorAll('.reset-pw-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const userId = btn.dataset.userId;
+        const username = btn.dataset.username;
+        const { close } = showModal({
+          title: `Reset Password — ${username}`,
+          description: 'Set a new password for this user. Their existing sessions will be signed out.',
+          content: `
+            <form id="reset-user-pw-form" novalidate>
+              <div class="form-group">
+                <label class="form-label" for="reset-user-new-pw">New Password</label>
+                <input type="password" class="form-input" id="reset-user-new-pw" required minlength="8" autocomplete="new-password" autofocus>
+                <p class="form-hint">Minimum 8 characters.</p>
+              </div>
+              <div id="reset-user-pw-error" class="form-error hidden" role="alert"></div>
+              <div class="modal-actions">
+                <button type="button" class="btn btn-ghost" data-action="cancel">Cancel</button>
+                <button type="submit" class="btn btn-primary">Set Password</button>
+              </div>
+            </form>
+          `,
+        });
+        const form = document.getElementById('reset-user-pw-form');
+        form.querySelector('[data-action="cancel"]').addEventListener('click', close);
+        form.addEventListener('submit', async (e) => {
+          e.preventDefault();
+          const errorEl = document.getElementById('reset-user-pw-error');
+          errorEl.classList.add('hidden');
+          const newPassword = document.getElementById('reset-user-new-pw').value;
+          if (newPassword.length < 8) {
+            errorEl.textContent = 'Password must be at least 8 characters.';
+            errorEl.classList.remove('hidden');
+            return;
+          }
+          try {
+            await apiPut(`/users/${userId}/password`, { new_password: newPassword });
+            close();
+            toast(`Password reset for ${username}`, 'success');
+          } catch (err) {
+            errorEl.textContent = err.message || 'Failed to reset password.';
+            errorEl.classList.remove('hidden');
+          }
+        });
       });
     });
   }
@@ -6321,7 +7446,7 @@
     const prefs = getReaderPreferences();
 
     return `
-      <div class="settings-section">
+      <div class="settings-section" data-cat="reader">
         <h3 style="display:flex;align-items:center;gap:var(--space-2)">${icon('bookOpen', 20)} Reading Preferences</h3>
         <p class="description">Defaults applied when opening a reader. Stored locally in this browser.</p>
 
@@ -6625,7 +7750,9 @@
 
       try {
         const searchParams = new URLSearchParams();
-        if (searchQuery) searchParams.set('q', searchQuery);
+        // The server requires a non-empty q; when only an author is given
+        // (e.g. "Find More by Author"), use the author name as the query too.
+        searchParams.set('q', searchQuery || searchAuthor);
         if (searchAuthor) searchParams.set('author', searchAuthor);
         const results = await apiGet(`/acquisition/search?${searchParams.toString()}`);
         const resultItems = Array.isArray(results) ? results : (results?.items || results?.results || []);
@@ -7680,34 +8807,288 @@
     }
   });
 
+  // --- Cloud Login ---
+
+  let cloudToken = null;
+  let cloudServiceUrl = null;
+
+  async function renderCloudLogin() {
+    setTitle(['Sign in with Ironshelf Cloud']);
+    breadcrumbTrail = [];
+
+    // Try to get cloud service URL from server's claim-status
+    let claimStatus = null;
+    try {
+      claimStatus = await fetch(`${API}/auth/claim-status`).then(r => r.ok ? r.json() : null).catch(() => null);
+    } catch { /* ignore */ }
+
+    const defaultCloudUrl = claimStatus?.cloud_service_url || CLOUD_API;
+
+    document.getElementById('app').innerHTML = `
+      <div class="login-page">
+        <div class="login-card">
+          <div class="brand">
+            <h1 class="text-brand">Ironshelf</h1>
+            <p>Sign in with Ironshelf Cloud</p>
+          </div>
+          <form id="cloud-login-form" novalidate>
+            <div class="form-group">
+              <label class="form-label" for="cloud-email">Email or Username</label>
+              <input type="text" class="form-input" id="cloud-email" name="email_or_username" required autocomplete="email" autofocus>
+            </div>
+            <div class="form-group">
+              <label class="form-label" for="cloud-password">Password</label>
+              <input type="password" class="form-input" id="cloud-password" name="password" required autocomplete="current-password">
+            </div>
+            <input type="hidden" id="cloud-service-url" value="${escapeHtml(defaultCloudUrl)}">
+            <button type="submit" class="btn btn-primary btn-lg">${icon('globe', 18)} Sign In</button>
+          </form>
+          <div class="login-footer">
+            <a href="#/login">Back to server login</a>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('cloud-login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const submitBtn = e.target.querySelector('button[type="submit"]');
+      submitBtn.disabled = true;
+      submitBtn.textContent = 'Signing in...';
+
+      const serviceUrl = document.getElementById('cloud-service-url').value;
+
+      try {
+        // Authenticate with the central cloud service
+        const cloudResponse = await fetch(`${serviceUrl}/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email_or_username: document.getElementById('cloud-email').value,
+            password: document.getElementById('cloud-password').value,
+          }),
+        });
+
+        if (!cloudResponse.ok) {
+          const errorData = await cloudResponse.json().catch(() => ({}));
+          throw new Error(errorData.error || 'Cloud authentication failed');
+        }
+
+        const cloudData = await cloudResponse.json();
+        if (!cloudData.ok || !cloudData.data?.token) {
+          throw new Error('Invalid response from cloud service');
+        }
+
+        // Store the cloud token and service URL for the server picker
+        cloudToken = cloudData.data.token;
+        cloudServiceUrl = serviceUrl;
+
+        // If this is a direct server login (server is claimed), try to get a token directly
+        if (claimStatus?.is_claimed && claimStatus?.server_id) {
+          await cloudLoginToServer(serviceUrl, cloudData.data.token, claimStatus.server_id);
+        } else {
+          // Show server picker — user picks which server to connect to
+          navigateTo('/cloud-servers');
+        }
+      } catch (err) {
+        toast(err.message, 'error');
+        submitBtn.disabled = false;
+        submitBtn.textContent = 'Sign In';
+      }
+    });
+  }
+
+  async function renderCloudServerPicker() {
+    setTitle(['Select Server']);
+    breadcrumbTrail = [];
+
+    if (!cloudToken || !cloudServiceUrl) {
+      navigateTo('/cloud-login');
+      return;
+    }
+
+    document.getElementById('app').innerHTML = `
+      <div class="login-page">
+        <div class="login-card" style="max-width: 500px">
+          <div class="brand">
+            <h1 class="text-brand">Ironshelf</h1>
+            <p>Select a server to connect to</p>
+          </div>
+          <div class="cloud-servers-loading">
+            <div class="skeleton skeleton-text" style="width:100%;height:48px;margin-bottom:8px"></div>
+            <div class="skeleton skeleton-text" style="width:100%;height:48px;margin-bottom:8px"></div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    try {
+      // Fetch servers the user has access to (owned + shared)
+      const [ownedResponse, sharedResponse] = await Promise.all([
+        fetch(`${cloudServiceUrl}/servers/mine`, {
+          headers: { 'Authorization': `Bearer ${cloudToken}` },
+        }),
+        fetch(`${cloudServiceUrl}/servers/shared`, {
+          headers: { 'Authorization': `Bearer ${cloudToken}` },
+        }),
+      ]);
+
+      const ownedData = ownedResponse.ok ? await ownedResponse.json() : { data: [] };
+      const sharedData = sharedResponse.ok ? await sharedResponse.json() : { data: [] };
+
+      const ownedServers = ownedData.data || [];
+      const sharedServers = sharedData.data || [];
+      const allServers = [
+        ...ownedServers.map(s => ({ ...s, relationship: 'owned' })),
+        ...sharedServers.map(s => ({ ...s, relationship: 'shared' })),
+      ];
+
+      if (allServers.length === 0) {
+        document.querySelector('.cloud-servers-loading').innerHTML = `
+          <div class="empty-state">
+            ${icon('server', 48)}
+            <p>No servers available</p>
+            <p class="text-muted" style="font-size:0.85rem">You don't have access to any servers yet. Ask a server owner to share access with you.</p>
+          </div>
+          <div class="login-footer" style="margin-top:1rem">
+            <a href="#/login">Back to server login</a>
+          </div>
+        `;
+        return;
+      }
+
+      const serverListHtml = allServers.map(server => `
+        <button class="cloud-server-btn" data-server-id="${escapeHtml(server.id)}" data-server-url="${escapeHtml(server.url)}">
+          <div class="cloud-server-info">
+            <span class="cloud-server-name">${icon('server', 16)} ${escapeHtml(server.name)}</span>
+            <span class="cloud-server-url text-muted">${escapeHtml(server.url)}</span>
+          </div>
+          <div class="cloud-server-meta">
+            <span class="badge ${server.relationship === 'owned' ? 'badge-primary' : 'badge-default'}">${server.relationship}</span>
+            ${server.is_verified ? `<span class="badge badge-success" title="Verified">${icon('check', 12)}</span>` : `<span class="badge badge-warning" title="Unverified">${icon('alertCircle', 12)}</span>`}
+          </div>
+        </button>
+      `).join('');
+
+      document.querySelector('.cloud-servers-loading').innerHTML = `
+        <div class="cloud-server-list">
+          ${serverListHtml}
+        </div>
+        <div class="login-footer" style="margin-top:1rem">
+          <a href="#/cloud-login">Sign in as different user</a> | <a href="#/login">Back to server login</a>
+        </div>
+      `;
+
+      // Bind click handlers for server buttons
+      document.querySelectorAll('.cloud-server-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const serverId = btn.dataset.serverId;
+          btn.disabled = true;
+          btn.style.opacity = '0.6';
+          try {
+            await cloudLoginToServer(cloudServiceUrl, cloudToken, serverId);
+          } catch (err) {
+            toast(err.message, 'error');
+            btn.disabled = false;
+            btn.style.opacity = '1';
+          }
+        });
+      });
+    } catch (err) {
+      toast('Failed to load servers: ' + err.message, 'error');
+      document.querySelector('.cloud-servers-loading').innerHTML = `
+        <div class="empty-state">
+          ${icon('alertCircle', 48)}
+          <p>Failed to load servers</p>
+          <p class="text-muted">${escapeHtml(err.message)}</p>
+        </div>
+        <div class="login-footer" style="margin-top:1rem">
+          <a href="#/cloud-login">Try again</a>
+        </div>
+      `;
+    }
+  }
+
+  /**
+   * Complete cloud login: get a server access token from the cloud service,
+   * then send it to the server's cloud-login endpoint to create a local session.
+   */
+  async function cloudLoginToServer(serviceUrl, centralToken, serverId) {
+    // 1. Get a short-lived server access token from the cloud service
+    const tokenResponse = await fetch(`${serviceUrl}/servers/${serverId}/token`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${centralToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!tokenResponse.ok) {
+      const errorData = await tokenResponse.json().catch(() => ({}));
+      throw new Error(errorData.error || 'Failed to get server access token');
+    }
+
+    const tokenData = await tokenResponse.json();
+    if (!tokenData.ok || !tokenData.data?.server_access_token) {
+      throw new Error('Invalid token response from cloud service');
+    }
+
+    // 2. Send the server access token to the server's cloud-login endpoint
+    const cloudLoginResponse = await fetch(`${API}/auth/cloud-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ cloud_token: tokenData.data.server_access_token }),
+    });
+
+    if (!cloudLoginResponse.ok) {
+      const errorData = await cloudLoginResponse.json().catch(() => ({}));
+      throw new Error(errorData.error || 'Server rejected cloud login');
+    }
+
+    // 3. Session cookie is set by the server response. Check auth and navigate.
+    cloudToken = null;
+    cloudServiceUrl = null;
+
+    if (await checkAuth()) {
+      startNotificationPolling();
+      fetchServerVersion();
+      toast('Signed in via Ironshelf Cloud', 'success');
+      navigateTo('/');
+    } else {
+      throw new Error('Cloud login succeeded but session was not established');
+    }
+  }
+
   // --- Init ---
 
   window.addEventListener('hashchange', route);
 
   window.addEventListener('DOMContentLoaded', async () => {
-    // Password-reset deep link: always show the connect/cloud screen (which
-    // hosts the reset form), even if a server URL is already saved.
-    if (window.location.hash.includes('cloud-reset')) {
-      renderConnectServer();
-      return;
-    }
-
-    // Hosted mode: require server URL before anything else
-    if (HOSTED_MODE && !SERVER_URL) {
+    // Hosted dashboard: a cloud-reset deep link, or no server chosen yet, shows
+    // the connect/cloud screen instead of the normal app bootstrap.
+    if (HOSTED && (window.location.hash.includes('cloud-reset') || !SERVER_URL)) {
       renderConnectServer();
       return;
     }
 
     if (await checkAuth()) {
       startNotificationPolling();
-      if (!getHashPath() || getHashPath() === '/login' || getHashPath() === '/connect') {
+      fetchServerVersion(); // fire-and-forget; populates sidebar + settings
+      if (!getHashPath() || getHashPath() === '/login') {
         navigateTo('/');
       } else {
         route();
       }
     } else {
       stopNotificationPolling();
-      navigateTo('/login');
+      // Allow cloud login routes without redirecting to /login
+      const currentPath = getHashPath();
+      if (currentPath === '/cloud-login' || currentPath === '/cloud-servers') {
+        route();
+      } else {
+        navigateTo('/login');
+      }
     }
   });
 
@@ -7766,7 +9147,7 @@
         bodyContent += '</div>';
       }
 
-      renderShell(bodyContent, 'libraries');
+      renderShell(bodyContent, 'settings');
 
       document.querySelectorAll('[data-book-id]').forEach(card => {
         const handler = () => navigateTo(`/book/${card.dataset.bookId}`);
@@ -7777,10 +9158,6 @@
       renderShell(renderError('Failed to load books', String(err?.message || err), renderMissingMetadata), 'libraries');
     }
   }
-
-  // --- Connect to Server (hosted mode) ---
-
-  const CLOUD_API = 'https://ironshelf-cloud.padragantrbs.workers.dev';
 
   function renderConnectServer() {
     const app = document.getElementById('app');
