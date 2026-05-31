@@ -7980,7 +7980,7 @@
           body: JSON.stringify({ email: form.get('email') }),
         });
         // Always show the same message (no account enumeration).
-        statusDiv.innerHTML = `<p style="color:var(--color-success)">If an account exists for that email, a reset link is on its way. Check your inbox.</p>`;
+        statusDiv.innerHTML = `<p style="color:var(--color-success)">If an account exists for that email, a reset link is on its way. Check your inbox — and your spam/junk folder if you don't see it within a few minutes.</p>`;
       } catch (err) {
         statusDiv.innerHTML = `<p style="color:var(--color-danger)">${escapeHtml(String(err.message))}</p>`;
       } finally {
