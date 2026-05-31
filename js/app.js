@@ -219,9 +219,13 @@
   // --- API Helpers ---
 
   async function api(path, options = {}) {
+    // The hosted UI is cross-origin to the server, so cookies don't apply —
+    // authenticate with the session token (or API key) as a Bearer header.
+    const serverToken = localStorage.getItem('ironshelf_server_token');
     const response = await fetch(`${API}${path}`, {
       headers: {
         'Content-Type': 'application/json',
+        ...(serverToken ? { 'Authorization': `Bearer ${serverToken}` } : {}),
         ...options.headers,
       },
       ...options,
@@ -1110,6 +1114,7 @@
     // Event bindings
     document.getElementById('logout-btn')?.addEventListener('click', async () => {
       await apiPost('/auth/logout', {}).catch(() => {});
+      localStorage.removeItem('ironshelf_server_token');
       currentUser = null;
       stopNotificationPolling();
       closeNotificationPanel();
@@ -1208,10 +1213,13 @@
       submitBtn.textContent = 'Signing in...';
 
       try {
-        await apiPost('/auth/login', {
+        const loginResult = await apiPost('/auth/login', {
           username: document.getElementById('login-username').value,
           password: document.getElementById('login-password').value,
         });
+        if (loginResult?.session_id) {
+          localStorage.setItem('ironshelf_server_token', loginResult.session_id);
+        }
         await checkAuth();
         navigateTo('/');
       } catch (err) {
@@ -2634,6 +2642,7 @@
       document.getElementById('disconnect-server-btn')?.addEventListener('click', () => {
         if (confirm('Disconnect from this server? You will need to reconnect.')) {
           localStorage.removeItem('ironshelf_server_url');
+          localStorage.removeItem('ironshelf_server_token');
           window.location.reload();
         }
       });
@@ -8152,7 +8161,12 @@
                 throw new Error(err.error || 'Server rejected cloud login');
               }
 
-              // Save server URL and reload
+              // Store the server session as a Bearer token (cross-origin: no
+              // cookie), then save the URL and reload into the connected UI.
+              const loginData = await loginRes.json().catch(() => ({}));
+              if (loginData?.session_id) {
+                localStorage.setItem('ironshelf_server_token', loginData.session_id);
+              }
               localStorage.setItem('ironshelf_server_url', serverUrl);
               window.location.reload();
             } catch (err) {
