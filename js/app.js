@@ -1045,7 +1045,7 @@
         <div class="sidebar-overlay" id="sidebar-overlay"></div>
         <aside class="sidebar" id="sidebar" role="navigation" aria-label="Main navigation">
           <div class="sidebar-brand">
-            <span class="text-brand">Iron<em>&</em>shelf</span>
+            <span class="text-brand">Ironshelf</span>
           </div>
           <div class="sidebar-notification-wrap" id="notification-bell-wrap">
             <button class="notification-bell-btn" id="notification-bell" aria-label="Notifications" title="Notifications">
@@ -1177,7 +1177,7 @@
       <div class="login-page">
         <div class="login-card">
           <div class="brand">
-            <h1 class="text-brand">Iron<em>&</em>shelf</h1>
+            <h1 class="text-brand">Ironshelf</h1>
             <p>Your self-hosted library</p>
           </div>
           ${serverInfoHtml}
@@ -1235,7 +1235,7 @@
       <div class="login-page">
         <div class="login-card">
           <div class="brand">
-            <h1 class="text-brand">Iron<em>&</em>shelf</h1>
+            <h1 class="text-brand">Ironshelf</h1>
             <p>Create your account</p>
           </div>
           ${isInviteRequired ? `<div class="login-server-info"><span class="badge badge-warning">${icon('lock', 12)} Invite required</span></div>` : ''}
@@ -7669,6 +7669,13 @@
   window.addEventListener('hashchange', route);
 
   window.addEventListener('DOMContentLoaded', async () => {
+    // Password-reset deep link: always show the connect/cloud screen (which
+    // hosts the reset form), even if a server URL is already saved.
+    if (window.location.hash.includes('cloud-reset')) {
+      renderConnectServer();
+      return;
+    }
+
     // Hosted mode: require server URL before anything else
     if (HOSTED_MODE && !SERVER_URL) {
       renderConnectServer();
@@ -7768,7 +7775,7 @@
         <div class="login-card" style="max-width:520px">
           <div class="login-brand" style="text-align:center;margin-bottom:var(--space-6)">
             <img src="/favicon.svg" alt="" width="48" height="48" style="margin-bottom:var(--space-2)">
-            <h1 class="text-brand" style="font-size:var(--text-2xl)">Iron<em>&amp;</em>shelf</h1>
+            <h1 class="text-brand" style="font-size:var(--text-2xl)">Ironshelf</h1>
             <p style="color:var(--color-text-dim);font-size:var(--text-sm)">Your books, everywhere</p>
           </div>
 
@@ -7797,8 +7804,38 @@
               <div id="cloud-login-status" style="margin-bottom:var(--space-3)"></div>
               <button type="submit" class="btn btn-primary" style="width:100%">Sign In</button>
               <p style="text-align:center;margin-top:var(--space-2);font-size:var(--text-sm)">
-                <a href="#" id="cloud-back-link">← Back</a>
+                <a href="#" id="cloud-forgot-link">Forgot password?</a> · <a href="#" id="cloud-back-link">← Back</a>
               </p>
+            </form>
+
+            <!-- Cloud Forgot Password Form (hidden initially) -->
+            <form id="cloud-forgot-form" style="display:none">
+              <h3 style="margin-bottom:var(--space-4)">Reset your password</h3>
+              <p style="color:var(--color-muted);font-size:var(--text-sm);margin-bottom:var(--space-3)">Enter your account email and we'll send you a reset link.</p>
+              <div class="form-group">
+                <label>Email</label>
+                <input type="email" class="form-input" name="email" required autofocus>
+              </div>
+              <div id="cloud-forgot-status" style="margin-bottom:var(--space-3)"></div>
+              <button type="submit" class="btn btn-primary" style="width:100%">Send reset link</button>
+              <p style="text-align:center;margin-top:var(--space-2);font-size:var(--text-sm)">
+                <a href="#" id="cloud-forgot-back-link">← Back to sign in</a>
+              </p>
+            </form>
+
+            <!-- Cloud Reset Password Form (shown via emailed link) -->
+            <form id="cloud-reset-form" style="display:none">
+              <h3 style="margin-bottom:var(--space-4)">Choose a new password</h3>
+              <div class="form-group">
+                <label>New Password</label>
+                <input type="password" class="form-input" name="new_password" required minlength="8" placeholder="At least 8 characters">
+              </div>
+              <div class="form-group">
+                <label>Confirm Password</label>
+                <input type="password" class="form-input" name="confirm_password" required minlength="8">
+              </div>
+              <div id="cloud-reset-status" style="margin-bottom:var(--space-3)"></div>
+              <button type="submit" class="btn btn-primary" style="width:100%">Set new password</button>
             </form>
 
             <!-- Cloud Register Form (hidden initially) -->
@@ -7908,12 +7945,16 @@
     const cloudLoginView = document.getElementById('cloud-login-view');
     const cloudLoginForm = document.getElementById('cloud-login-form');
     const cloudRegisterForm = document.getElementById('cloud-register-form');
+    const cloudForgotForm = document.getElementById('cloud-forgot-form');
+    const cloudResetForm = document.getElementById('cloud-reset-form');
     const cloudServerPicker = document.getElementById('cloud-server-picker');
 
     function showView(view) {
       cloudLoginView.style.display = view === 'buttons' ? '' : 'none';
       cloudLoginForm.style.display = view === 'login' ? '' : 'none';
       cloudRegisterForm.style.display = view === 'register' ? '' : 'none';
+      cloudForgotForm.style.display = view === 'forgot' ? '' : 'none';
+      cloudResetForm.style.display = view === 'reset' ? '' : 'none';
       cloudServerPicker.style.display = view === 'servers' ? '' : 'none';
     }
 
@@ -7921,6 +7962,73 @@
     document.getElementById('cloud-register-link')?.addEventListener('click', (e) => { e.preventDefault(); showView('register'); });
     document.getElementById('cloud-back-link')?.addEventListener('click', (e) => { e.preventDefault(); showView('buttons'); });
     document.getElementById('cloud-login-link')?.addEventListener('click', (e) => { e.preventDefault(); showView('login'); });
+    document.getElementById('cloud-forgot-link')?.addEventListener('click', (e) => { e.preventDefault(); showView('forgot'); });
+    document.getElementById('cloud-forgot-back-link')?.addEventListener('click', (e) => { e.preventDefault(); showView('login'); });
+
+    // Cloud forgot password — request a reset email.
+    cloudForgotForm.onsubmit = async (e) => {
+      e.preventDefault();
+      const form = new FormData(e.target);
+      const statusDiv = document.getElementById('cloud-forgot-status');
+      const submitBtn = e.target.querySelector('button[type="submit"]');
+      statusDiv.innerHTML = '';
+      submitBtn.disabled = true;
+      try {
+        await fetch(`${CLOUD_API}/auth/forgot-password`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: form.get('email') }),
+        });
+        // Always show the same message (no account enumeration).
+        statusDiv.innerHTML = `<p style="color:var(--color-success)">If an account exists for that email, a reset link is on its way. Check your inbox.</p>`;
+      } catch (err) {
+        statusDiv.innerHTML = `<p style="color:var(--color-danger)">${escapeHtml(String(err.message))}</p>`;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    };
+
+    // Cloud reset password — set a new password using the emailed token.
+    let cloudResetToken = '';
+    cloudResetForm.onsubmit = async (e) => {
+      e.preventDefault();
+      const form = new FormData(e.target);
+      const statusDiv = document.getElementById('cloud-reset-status');
+      const submitBtn = e.target.querySelector('button[type="submit"]');
+      statusDiv.innerHTML = '';
+      const newPassword = form.get('new_password');
+      if (newPassword !== form.get('confirm_password')) {
+        statusDiv.innerHTML = `<p style="color:var(--color-danger)">Passwords do not match.</p>`;
+        return;
+      }
+      submitBtn.disabled = true;
+      try {
+        const res = await fetch(`${CLOUD_API}/auth/reset-password`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: cloudResetToken, new_password: newPassword }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Reset failed');
+        statusDiv.innerHTML = `<p style="color:var(--color-success)">Password updated. You can sign in now.</p>`;
+        // Clear the token from the URL and return to sign-in.
+        if (window.history?.replaceState) {
+          window.history.replaceState(null, '', window.location.pathname);
+        }
+        setTimeout(() => showView('login'), 1200);
+      } catch (err) {
+        statusDiv.innerHTML = `<p style="color:var(--color-danger)">${escapeHtml(String(err.message))}</p>`;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    };
+
+    // If arriving from a reset email (#/cloud-reset?token=...), show the reset form.
+    const resetTokenMatch = window.location.hash.match(/[?&]token=([^&]+)/);
+    if (window.location.hash.includes('cloud-reset') && resetTokenMatch) {
+      cloudResetToken = decodeURIComponent(resetTokenMatch[1]);
+      showView('reset');
+    }
 
     // Cloud login
     cloudLoginForm.onsubmit = async (e) => {
